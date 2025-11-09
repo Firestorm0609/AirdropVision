@@ -315,8 +315,63 @@ def main():
     updater.idle()
 
 
-if __name__ == "__main__":
+# -------------------------
+# Production Entry (Railway)
+# -------------------------
+import threading
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+
+def run_bot():
+    """Runs the Telegram bot (PTB 13) inside a thread."""
     try:
-        main()
-    except KeyboardInterrupt:
-        logger.info("Shutdown requested.")
+        from telegram.ext import Updater
+        updater = Updater(TELEGRAM_TOKEN, use_context=True)
+
+        dispatcher = updater.dispatcher
+
+        # attach your handlers again if needed
+        # dispatcher.add_handler(CommandHandler("start", start))
+        # dispatcher.add_handler(CallbackQueryHandler(button_handler))
+
+        updater.start_polling()
+        updater.idle()
+    except Exception as e:
+        print("BOT THREAD CRASHED:", e)
+
+
+def run_scheduler():
+    """Runs your scheduled loops, blockchain scanners, etc."""
+    try:
+        while True:
+            run_polygon_scan()      # your own function
+            run_solana_scan()       # your own function
+            time.sleep(SCAN_INTERVAL)
+    except Exception as e:
+        print("SCHEDULER CRASHED:", e)
+
+
+if __name__ == "__main__":
+    print("Starting AirdropVision in multi-thread mode...")
+
+    # thread: telegram bot
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+
+    # thread: main blockchain scanner / scheduler
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+
+    # Railway only pings Flask, so Flask is the main process
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        debug=False,
+        use_reloader=False
+    )
