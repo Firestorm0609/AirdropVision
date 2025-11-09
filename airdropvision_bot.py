@@ -375,3 +375,64 @@ if __name__ == "__main__":
         debug=False,
         use_reloader=False
     )
+# -------------------------
+# PRODUCTION ENTRY (Railway)
+# Telegram bot runs in MAIN THREAD
+# Flask + Scheduler run in background threads
+# -------------------------
+
+import threading
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+
+def run_flask():
+    """Run Flask in a background thread for Railway health checks."""
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080)),
+        debug=False,
+        use_reloader=False
+    )
+
+
+def run_scheduler():
+    """Runs your blockchain scanner loop."""
+    try:
+        while True:
+            run_polygon_scan()
+            run_solana_scan()
+            time.sleep(SCAN_INTERVAL)
+    except Exception as e:
+        print("SCHEDULER CRASHED:", e)
+
+
+if __name__ == "__main__":
+    print("Starting AirdropVision (main thread bot, threaded Flask & scheduler)")
+
+    # Start Flask in background
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Start scheduler in background
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+
+    # -----------------------
+    # Telegram bot in MAIN thread
+    # -----------------------
+    from telegram.ext import Updater
+
+    updater = Updater(TELEGRAM_TOKEN, use_context=True)
+
+    # your handlers are already added above or can be added here:
+    # dispatcher = updater.dispatcher
+    # dispatcher.add_handler(CommandHandler("start", start))
+
+    updater.start_polling()
+    updater.idle()
