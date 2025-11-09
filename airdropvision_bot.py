@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
-AirdropVision - improved version
-Features:
-- SQLite persistence (seen items + meta like last processed blocks)
-- Rate-limited Telegram sender with backoff
-- Ethereum, Polygon, Solana scanning (free public RPCs)
-- Minimal token metadata probing (name/symbol for ERC20)
-- Clean logging
-- Config via environment variables (suitable for Railway)
-
+AirdropVision - PTB v13 compatible version (synchronous Updater)
 Drop this file into the repository root as `app.py`.
 """
 
@@ -19,10 +11,12 @@ import sqlite3
 import logging
 import requests
 import asyncio
+import threading
 from datetime import datetime
 from typing import Optional
 from web3 import Web3
 from solana.rpc.async_api import AsyncClient as SolanaClient
+from flask import Flask
 
 # ----------------- CONFIG -----------------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -73,7 +67,6 @@ class DB:
         self.conn.execute(CREATE_SEEN_SQL)
         self.conn.execute(CREATE_META_SQL)
         self.conn.commit()
-        self._lock = asyncio.Lock()
 
     def seen_add(self, id: str, kind: str = "generic", meta: Optional[dict] = None) -> bool:
         try:
@@ -96,15 +89,17 @@ class DB:
         self.conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)", (k, v))
         self.conn.commit()
 
-
 db = DB()
 
-# ----------------- TELEGRAM SENDER (rate limited + backoff) -----------------
+# ----------------- TELEGRAM SENDER (sync, rate-limited + backoff) -----------------
 session = requests.Session()
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-async def telegram_send(text: str, parse_mode: str = "Markdown"):
-    # Simple rate-limited sender using asyncio sleep to respect Telegram limits
+def send_telegram(text: str, parse_mode: str = "Markdown") -> bool:
+    """
+    Synchronous Telegram sender with simple exponential backoff and 429 handling.
+    Safe to call from threads.
+    """
     url = f"{TELEGRAM_API_BASE}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode}
 
@@ -114,22 +109,21 @@ async def telegram_send(text: str, parse_mode: str = "Markdown"):
             r = session.post(url, json=payload, timeout=10)
         except requests.RequestException as e:
             logger.warning("Telegram send exception: %s", e)
-            await asyncio.sleep(backoff)
+            time.sleep(backoff)
             backoff = min(backoff * 2, 60)
             continue
 
         if r.status_code == 200:
-            await asyncio.sleep(TELEGRAM_SEND_DELAY_SEC)  # small gap between messages
+            time.sleep(TELEGRAM_SEND_DELAY_SEC)
             return True
         elif r.status_code == 429:
-            # Too Many Requests -- respect retry_after if present
             try:
                 body = r.json()
                 retry_after = int(body.get("parameters", {}).get("retry_after", 5))
             except Exception:
                 retry_after = backoff
             logger.warning("Telegram rate limited, retrying after %s seconds", retry_after)
-            await asyncio.sleep(retry_after)
+            time.sleep(retry_after)
             backoff = min(backoff * 2, 60)
             continue
         else:
@@ -137,9 +131,10 @@ async def telegram_send(text: str, parse_mode: str = "Markdown"):
             return False
 
 # ----------------- SCANNERS -----------------
-
 def probe_erc20_metadata(contract_address: str, w3: Web3) -> dict:
     """Try to read name/symbol/decimals from a contract (best-effort)."""
+    if not contract_address:
+        return {}
     try:
         erc20_abi = [
             {"constant":True,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function"},
@@ -163,7 +158,6 @@ def probe_erc20_metadata(contract_address: str, w3: Web3) -> dict:
     except Exception as e:
         logger.debug("ERC20 probe failed: %s", e)
         return {}
-
 
 def scan_chain_for_contract_creations(w3: Web3, chain_name: str, meta_key_last_block: str):
     try:
@@ -205,19 +199,23 @@ def scan_chain_for_contract_creations(w3: Web3, chain_name: str, meta_key_last_b
                             contract_addr = None
 
                         metadata = probe_erc20_metadata(contract_addr, w3) if contract_addr else {}
-                        loop = asyncio.get_event_loop()
-                        msg = f"🟢 New {chain_name} contract creation\nTx: `{tx_hash}`\nContract: `{contract_addr}`\nName: {metadata.get('name')}\nSymbol: {metadata.get('symbol')}`"
-                        asyncio.run_coroutine_threadsafe(telegram_send(msg), loop)
+                        msg = (
+                            f"🟢 New {chain_name} contract creation\n"
+                            f"Tx: `{tx_hash}`\n"
+                            f"Contract: `{contract_addr}`\n"
+                            f"Name: {metadata.get('name')}\n"
+                            f"Symbol: {metadata.get('symbol')}"
+                        )
+                        # synchronous send
+                        send_telegram(msg)
             except Exception as e:
                 logger.debug("Error processing tx in block %s: %s", bn, e)
 
     db.meta_set(meta_key_last_block, str(end))
 
-
 async def scan_solana(latest_limit: int = MAX_RESULTS):
     try:
         async with SolanaClient(SOLANA_RPC) as client:
-            # Best-effort: get signatures for recent slots of the system program (lightweight)
             resp = await client.get_signatures_for_address("So11111111111111111111111111111111111111112", limit=latest_limit)
             results = resp.get('result') if isinstance(resp, dict) else None
             if not results:
@@ -226,10 +224,11 @@ async def scan_solana(latest_limit: int = MAX_RESULTS):
             for tx in results:
                 sig = tx.get('signature')
                 if sig and db.seen_add(sig, kind='solana_sig'):
-                    asyncio.ensure_future(telegram_send(f"🌞 New Solana signature: `{sig}`"))
+                    # run blocking send_telegram in thread pool to avoid blocking asyncio loop
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, send_telegram, f"🌞 New Solana signature: `{sig}`")
     except Exception as e:
         logger.error("Solana scan failed: %s", e)
-
 
 # ----------------- SCHEDULER -----------------
 async def scheduler_loop():
@@ -247,63 +246,74 @@ async def scheduler_loop():
             logger.exception("Scheduler loop error: %s", e)
         await asyncio.sleep(POLL_INTERVAL_MINUTES * 60)
 
+def start_scheduler_in_thread():
+    def runner():
+        try:
+            asyncio.run(scheduler_loop())
+        except Exception as e:
+            logger.exception("Scheduler thread crashed: %s", e)
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
 
-# ----------------- TELEGRAM BOT HANDLERS (simple) -----------------
+# ----------------- TELEGRAM BOT HANDLERS (PTB v13) -----------------
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")]]
+def start_cmd(update: Update, context: CallbackContext):
+    keyboard = [
+        [InlineKeyboardButton("📊 Stats", callback_data="stats"),
+         InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")],
+    ]
     text = f"🤖 *{BOT_NAME} v{VERSION}*\nPolling every {POLL_INTERVAL_MINUTES} minute(s)\nSeen: {db.seen_count()}"
-    await update.message.reply_markdown(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def button_cb(update: Update, context: CallbackContext):
     query = update.callback_query
-    await query.answer()
+    query.answer()
     if query.data == 'stats':
-        await query.edit_message_text(f"📊 {BOT_NAME} v{VERSION}\nTracked: {db.seen_count()} items.")
+        query.edit_message_text(f"📊 {BOT_NAME} v{VERSION}\nTracked: {db.seen_count()} items.")
     elif query.data == 'scan_now':
-        await query.edit_message_text("⏳ Running manual scan...")
+        query.edit_message_text("⏳ Running manual scan...")
         # Run quick scans
         scan_chain_for_contract_creations(w3_eth, 'Ethereum', 'last_eth_block')
         scan_chain_for_contract_creations(w3_poly, 'Polygon', 'last_poly_block')
-        await scan_solana()
-        await query.edit_message_text("✅ Scan complete!")
+        # run solana scan synchronously
+        try:
+            asyncio.run(scan_solana())
+        except Exception as e:
+            logger.exception("Manual solana scan failed: %s", e)
+        query.edit_message_text("✅ Scan complete!")
 
-async def main():
-    # sanity checks
+def run_telegram_bot():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in environment variables.")
-        return
+        raise SystemExit(1)
 
-    # start background scheduler
-    loop = asyncio.get_event_loop()
-    loop.create_task(scheduler_loop())
+    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", start_cmd))
+    dp.add_handler(CallbackQueryHandler(button_cb))
 
-    # start telegram bot
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(button_cb))
+    # Start scheduler background thread
+    start_scheduler_in_thread()
 
-    # health endpoint is handled by Railway via port exposure / additional lightweight web server if needed
-    await app.start()
-    await app.updater.start_polling()
-    logger.info("Bot started. Ready to receive commands.")
-    # keep running
-    await asyncio.Event().wait()
+    # Start Flask health endpoint in a thread so Railway/Render can hit it
+    def run_flask():
+        health_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    threading.Thread(target=run_flask, daemon=True).start()
 
+    logger.info("Starting Telegram polling...")
+    updater.start_polling()
+    updater.idle()
 
 # --- Flask health endpoint ---
-from flask import Flask
 health_app = Flask(__name__)
-
 @health_app.route('/')
 def health():
     return 'OK', 200
 
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        run_telegram_bot()
     except KeyboardInterrupt:
         logger.info("Shutting down...")
-

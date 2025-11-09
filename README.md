@@ -1,47 +1,61 @@
 # AirdropVision Bot
+A Python-based Telegram bot that scans Ethereum, Polygon, and Solana for new Airdrops and NFT launches. Built with Python and deployed on Railway.
 
-A Python-based Telegram bot that scans Ethereum, Polygon, and Solana for new token deployments and signatures.
-
+---
 ## Features
+- Telegram-only bot
+- Tracks ETH and SOL wallets
+- Uses free, non-paid public APIs
+- Auto-restarter via Railway health checks
+- SQLite persistent storage
+- Automatic token metadata scraping
+- Clean logging
 
-* Scans Ethereum and Polygon using public RPC endpoints.
-* Solana signature scanning via public RPC.
-* Telegram bot alerts.
-* SQLite database persistence.
-* Rate limiting to avoid Telegram 429 errors.
-* Flask health endpoint for Railway health checks.
+---
+## Requirements
+- Python 3.11+
+- `python-telegram-bot==13.15`
+- Free API keys
 
-## Setup
+---
+## Environment Variables
+Create a `.env` file or set these in Railway:
+TELEGRAM_TOKEN=your_bot_token ETHERSCAN_API_KEY=your_etherscan_key SOLANA_RPC=https://api.mainnet-beta.solana.com PORT=8080
 
-1. Clone this repo.
-2. Install dependencies:
+---
+## Local Setup
 
-```
-pip install -r requirements.txt
-```
+git clone https://github.com/Firestorm0609/AirdropVision.git cd AirdropVision
 
-3. Create `.env` file with:
+python3 -m venv .venv source .venv/bin/activate
 
-```
-TELEGRAM_TOKEN=your_bot_token
-TELEGRAM_CHAT_ID=your_chat_id
-POLL_INTERVAL=1
-MAX_RESULTS=25
-```
+pip install -r requirements.txt python airdropvision_bot.py
 
-4. Run locally:
+---
+## Railway Deployment
+1. Login to https://railway.app
+2. Create **New Project**
+3. Choose **Deploy from GitHub**
+4. Select repository: `Firestorm0609/AirdropVision`
+5. Go to "Variables" and add:
+   - `TELEGRAM_TOKEN`
+   - `ETHERSCAN_API_KEY`
+   - `SOLANA_RPC`
+   - `PORT=8080`
+6. Railway automatically runs `Procfile`
+7. Visit `/health` endpoint to confirm service is running
 
-```
-python app.py
-```
+---
+## Procfile
 
-## Deployment on Railway
+web: python airdropvision_bot.py
 
-1. Connect GitHub repo to Railway.
-2. Set environment variables in project settings.
-3. Deploy using included `Procfile`.
+---
+## runtime.txt
 
-## GitHub Actions for Termux
+python-3.11.9
 
-Termux-compatible GitHub Actions can be added for CI workflows.
+---
+## License
+MIT
 

@@ -1,3 +1,29 @@
+# Python
 __pycache__/
-airdropvision.db
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables
 .env
+*.env
+
+# Railway / build artifacts
+*.log
+*.pid
+
+# SQLite database
+*.db
+*.sqlite3
+
+# MacOS
+.DS_Store
+
+# VSCode
+.vscode/
