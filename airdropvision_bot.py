@@ -51,7 +51,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 CREATE_SEEN_SQL = """ CREATE TABLE IF NOT EXISTS seen ( id TEXT PRIMARY KEY, kind TEXT, meta TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ); """
 
-CREATE_META_SQL = """ CREATE TABLE IF NOT EXISTS meta ( k TEXT PRIMARY KEY, v TEXT ); """ = """ CREATE TABLE IF NOT EXISTS meta ( k TEXT PRIMARY KEY, v TEXT ); """ CREATE TABLE IF NOT EXISTS meta ( k TEXT PRIMARY KEY, v TEXT ); """
+CREATE_META_SQL = """ CREATE TABLE IF NOT EXISTS meta ( k TEXT PRIMARY KEY, v TEXT ); """
 
 class DB: def init(self, path=DB_PATH): self.conn = sqlite3.connect(path, check_same_thread=False) self.conn.execute(CREATE_SEEN_SQL) self.conn.execute(CREATE_META_SQL) self.conn.commit() self._lock = threading.Lock()
 
@@ -155,15 +155,15 @@ for nft in items:
         url = nft.get("url") if isinstance(nft, dict) else None
         date = nft.get("launch_date") if isinstance(nft, dict) else None
         tag = "FREE MINT" if likely_free else "Upcoming"
-        msg = f"🎨 {tag}: *{nft.get('name') or nft_id}*\nDate: {date}\nLink: {url or 'N/A'}"
-        send_telegram_sync(msg)
-        count += 1
+        msg = f"🎨 {tag}: *{nft.get('name') or nft_id}*
+
+Date: {date} Link: {url or 'N/A'}" send_telegram_sync(msg) count += 1
 
 ----------------- Nitter scraper -----------------
 
 def parse_nitter_search_html(html: str, base_url: str) -> List[dict]: soup = BeautifulSoup(html, "lxml") results = [] for a in soup.find_all("a", href=True): href = a["href"] parts = href.split("/") if len(parts) >= 4 and parts[2] in ("status", "statuses"): try: tweet_id = parts[3] except Exception: continue user = parts[1] if len(parts) > 1 else None tweet_url = urllib.parse.urljoin(base_url, href) parent = a.find_parent() text = "" if parent: content_div = parent.find("div", class_="tweet-content") or parent.find("div", class_="content") if content_div: text = content_div.get_text(" ", strip=True) results.append({"id": tweet_id, "user": user, "url": tweet_url, "text": text}) dedup = [] seen_ids = set() for r in results: if r["id"] not in seen_ids: dedup.append(r) seen_ids.add(r["id"]) return dedup
 
-def scan_nitter_for_queries(queries: List[str], limit_per_query: int = 10): headers = {"User-Agent": "AirdropVision/Offchain (+https://github.com)"} for instance in NITTER_INSTANCES: try: logger.info("Trying Nitter instance: %s", instance) working = False total_found = 0 for q in queries: q_enc = urllib.parse.quote(q) url = f"{instance}/search?f=tweets&q={q_enc}" try: r = session.get(url, headers=headers, timeout=12) if r.status_code != 200: logger.debug("Nitter %s returned %s for query %s", instance, r.status_code, q) continue parsed = parse_nitter_search_html(r.text, instance) if not parsed: logger.debug("Nitter %s parse returned 0 results for %s", instance, q) continue working = True for tweet in parsed[:limit_per_query]: tweet_id = tweet["id"] seen_key = f"tweet:{tweet_id}" if db.seen_add(seen_key, kind="nitter", meta=tweet): txt = (tweet.get("text") or "").lower() tag = "FREE MINT" if "free mint" in txt or "free-mint" in txt or "free mint nft" in txt else ("AIRDROP" if "airdrop" in txt else "TWEET") msg = f"🐦 {tag}: {tweet.get('user') or 'user'}\n{tweet.get('text') or ''}\nLink: {tweet.get('url')}" send_telegram_sync(msg) total_found += 1 time.sleep(0.25) time.sleep(1.0) except Exception as e: logger.debug("Nitter fetch error for %s: %s", url, e) continue if working: logger.info("Nitter instance %s worked, found %s new items", instance, total_found) return except Exception as e: logger.debug("Nitter instance %s failed: %s", instance, e) continue
+def scan_nitter_for_queries(queries: List[str], limit_per_query: int = 10): headers = {"User-Agent": "AirdropVision/Offchain (+https://github.com)"} for instance in NITTER_INSTANCES: try: logger.info("Trying Nitter instance: %s", instance) working = False total_found = 0 for q in queries: q_enc = urllib.parse.quote(q) url = f"{instance}/search?f=tweets&q={q_enc}" try: r = session.get(url, headers=headers, timeout=12) if r.status_code != 200: logger.debug("Nitter %s returned %s for query %s", instance, r.status_code, q) continue parsed = parse_nitter_search_html(r.text, instance) if not parsed: logger.debug("Nitter %s parse returned 0 results for %s", instance, q) continue working = True for tweet in parsed[:limit_per_query]: tweet_id = tweet["id"] seen_key = f"tweet:{tweet_id}" if db.seen_add(seen_key, kind="nitter", meta=tweet): txt = (tweet.get("text") or "").lower() tag = "FREE MINT" if "free mint" in txt or "free-mint" in txt or "free mint nft" in txt else ("AIRDROP" if "airdrop" in txt else "TWEET") msg = f"🐦 {tag}: {tweet.get('user') or 'user'} {tweet.get('text') or ''} Link: {tweet.get('url')}" send_telegram_sync(msg) total_found += 1 time.sleep(0.25) time.sleep(1.0) except Exception as e: logger.debug("Nitter fetch error for %s: %s", url, e) continue if working: logger.info("Nitter instance %s worked, found %s new items", instance, total_found) return except Exception as e: logger.debug("Nitter instance %s failed: %s", instance, e) continue
 
 ----------------- SCHEDULER -----------------
 
@@ -171,9 +171,9 @@ def scheduler_loop(): logger.info("Scheduler thread started, interval=%s minute(
 
 ----------------- TELEGRAM COMMANDS -----------------
 
-def start_cmd(update: Update, context: CallbackContext): keyboard = [[InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")]] text = f"🤖 {BOT_NAME} v{VERSION}\nPolling every {POLL_INTERVAL_MINUTES}m\nSeen: {db.seen_count()}" update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+def start_cmd(update: Update, context: CallbackContext): keyboard = [[InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")]] text = f"🤖 {BOT_NAME} v{VERSION} Polling every {POLL_INTERVAL_MINUTES}m Seen: {db.seen_count()}" update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-def callback_handler(update: Update, context: CallbackContext): query = update.callback_query if not query: return query.answer() if query.data == "stats": query.edit_message_text(f"📊 {BOT_NAME} v{VERSION}\nTracked: {db.seen_count()} items.") elif query.data == "scan_now": query.edit_message_text("⏳ Manual scan started...") threading.Thread(target=scan_nftcalendar, kwargs={"limit": MAX_RESULTS}, daemon=True).start() threading.Thread(target=scan_nitter_for_queries, args=(NITTER_SEARCH_QUERIES, min(10, MAX_RESULTS)), daemon=True).start() query.edit_message_text("✅ Manual scan started.")
+def callback_handler(update: Update, context: CallbackContext): query = update.callback_query if not query: return query.answer() if query.data == "stats": query.edit_message_text(f"📊 {BOT_NAME} v{VERSION} Tracked: {db.seen_count()} items.") elif query.data == "scan_now": query.edit_message_text("⏳ Manual scan started...") threading.Thread(target=scan_nftcalendar, kwargs={"limit": MAX_RESULTS}, daemon=True).start() threading.Thread(target=scan_nitter_for_queries, args=(NITTER_SEARCH_QUERIES, min(10, MAX_RESULTS)), daemon=True).start() query.edit_message_text("✅ Manual scan started.")
 
 ----------------- FLASK health app -----------------
 
