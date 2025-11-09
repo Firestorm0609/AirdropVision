@@ -1,343 +1,210 @@
-#!/usr/bin/env python3
-"""
-AirdropVision - PTB13-compatible single-file bot
+#!/usr/bin/env python3 """ AirdropVision — Off-chain bot (NFTCalendar + Nitter)
 
-- Telegram bot runs in main thread (PTB 13 Updater).
-- Scheduler (blockchain scanners) runs in a background thread.
-- Flask health endpoint runs in a background thread (for Railway / Render health checks).
-- SQLite persistence for seen items and last-processed blocks.
-- Uses public RPC endpoints (no paid APIs).
-"""
+Features:
 
-import os
-import json
-import sqlite3
-import time
-import logging
-import threading
-import requests
-import asyncio
-from typing import Optional
-from web3 import Web3
-from web3.middleware import geth_poa_middleware
-from solana.rpc.async_api import AsyncClient as SolanaClient
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
-from flask import Flask
+Scans nftcalendar.io upcoming API for free-mints and upcoming drops
 
-# ----------------- CONFIG -----------------
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "1"))  # minutes
-MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
-BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = os.environ.get("VERSION", "2.0.0")
-DB_PATH = os.environ.get("DB_PATH", "airdropvision.db")
+Scrapes public Nitter instances for tweets matching free-mint / airdrop queries (no X API)
 
-ETH_RPC = os.environ.get("ETH_RPC", "https://cloudflare-eth.com")
-POLY_RPC = os.environ.get("POLY_RPC", "https://polygon-rpc.com")
-SOLANA_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-SOLANA_RPC_FALLBACK = os.environ.get("SOLANA_RPC_FALLBACK", SOLANA_RPC)
+SQLite persistence (seen items + meta)
 
-MAX_BLOCKS_PER_CYCLE = int(os.environ.get("MAX_BLOCKS_PER_CYCLE", "3"))
-TELEGRAM_SEND_DELAY_SEC = float(os.environ.get("TELEGRAM_SEND_DELAY_SEC", "1.0"))
-TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+Flask health endpoint (for hosting healthchecks)
 
-# ----------------- LOGGING -----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(BOT_NAME)
+Telegram alerts (python-telegram-bot PTB v13)
 
-# ----------------- WEB3 clients -----------------
-w3_eth = Web3(Web3.HTTPProvider(ETH_RPC))
-w3_poly = Web3(Web3.HTTPProvider(POLY_RPC))
-# fix POA extraData issue for Polygon/geth-style chains
-try:
-    w3_poly.middleware_onion.inject(geth_poa_middleware, layer=0)
-except Exception:
-    pass
+Background scheduler thread
 
-# ----------------- DB -----------------
-CREATE_SEEN_SQL = """
-CREATE TABLE IF NOT EXISTS seen (
-    id TEXT PRIMARY KEY,
-    kind TEXT,
-    meta TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"""
-CREATE_META_SQL = """
-CREATE TABLE IF NOT EXISTS meta (
-    k TEXT PRIMARY KEY,
-    v TEXT
-);
-"""
 
-class DB:
-    def __init__(self, path=DB_PATH):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.execute(CREATE_SEEN_SQL)
-        self.conn.execute(CREATE_META_SQL)
-        self.conn.commit()
-        self._lock = threading.Lock()
+Usage:
 
-    def seen_add(self, id: str, kind: str = "generic", meta: Optional[dict] = None) -> bool:
-        with self._lock:
-            try:
-                self.conn.execute("INSERT INTO seen(id, kind, meta) VALUES (?, ?, ?)",
-                                  (id, kind, json.dumps(meta or {})))
-                self.conn.commit()
-                return True
-            except sqlite3.IntegrityError:
-                return False
+Configure environment variables (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, etc.) or use a .env loader
 
-    def seen_count(self) -> int:
-        with self._lock:
-            cur = self.conn.execute("SELECT COUNT(1) FROM seen")
-            return cur.fetchone()[0]
+Run: python airdropvision_offchain.py
 
-    def meta_get(self, k: str, default=None):
-        with self._lock:
-            cur = self.conn.execute("SELECT v FROM meta WHERE k=?", (k,))
-            row = cur.fetchone()
-            return row[0] if row else default
 
-    def meta_set(self, k: str, v: str):
-        with self._lock:
-            self.conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)", (k, v))
+Notes:
+
+This file intentionally contains NO on-chain scanners (Ethereum/Polygon/Solana) per your request.
+
+Heuristics are best-effort. Tweak search queries and nftcalendar logic to taste. """
+
+
+import os import json import sqlite3 import time import logging import threading import requests import urllib.parse from typing import Optional, List from datetime import datetime from bs4 import BeautifulSoup from flask import Flask from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
+
+----------------- CONFIG -----------------
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "1"))  # minutes MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25")) BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision — Offchain") VERSION = os.environ.get("VERSION", "1.0.0") DB_PATH = os.environ.get("DB_PATH", "airdropvision_offchain.db")
+
+NFTCALENDAR_API = os.environ.get("NFTCALENDAR_API", "https://api.nftcalendar.io/upcoming")
+
+NITTER_INSTANCES = [ os.environ.get("NITTER_PRIMARY", "https://nitter.net"), os.environ.get("NITTER_FALLBACK1", "https://nitter.snopyta.org"), os.environ.get("NITTER_FALLBACK2", "https://nitter.1d4.us"), ]
+
+NITTER_SEARCH_QUERIES = [ '("free mint" OR "free-mint" OR "free mint nft") lang:en', '("airdrop" OR "air drop") lang:en', '("solana free mint" OR "sol mint") lang:en', '("eth free mint") lang:en', ]
+
+TELEGRAM_SEND_DELAY_SEC = float(os.environ.get("TELEGRAM_SEND_DELAY_SEC", "0.8")) TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+----------------- LOGGING -----------------
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s") logger = logging.getLogger(BOT_NAME)
+
+----------------- DB -----------------
+
+CREATE_SEEN_SQL = """ CREATE TABLE IF NOT EXISTS seen ( id TEXT PRIMARY KEY, kind TEXT, meta TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ); """ CREATE_META_SQL = """ CREATE TABLE IF NOT EXISTS meta ( k TEXT PRIMARY KEY, v TEXT ); """
+
+class DB: def init(self, path=DB_PATH): self.conn = sqlite3.connect(path, check_same_thread=False) self.conn.execute(CREATE_SEEN_SQL) self.conn.execute(CREATE_META_SQL) self.conn.commit() self._lock = threading.Lock()
+
+def seen_add(self, id: str, kind: str = "generic", meta: Optional[dict] = None) -> bool:
+    with self._lock:
+        try:
+            self.conn.execute("INSERT INTO seen(id, kind, meta) VALUES (?, ?, ?)",
+                              (id, kind, json.dumps(meta or {})))
             self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+def seen_count(self) -> int:
+    with self._lock:
+        cur = self.conn.execute("SELECT COUNT(1) FROM seen")
+        return cur.fetchone()[0]
+
+def meta_get(self, k: str, default=None):
+    with self._lock:
+        cur = self.conn.execute("SELECT v FROM meta WHERE k=?", (k,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+def meta_set(self, k: str, v: str):
+    with self._lock:
+        self.conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)", (k, v))
+        self.conn.commit()
 
 db = DB()
 
-# ----------------- TELEGRAM SENDER (sync, rate-limited, backoff) -----------------
-session = requests.Session()
+----------------- SESSION -----------------
 
-def send_telegram_sync(text: str, parse_mode: str = "Markdown") -> bool:
-    """
-    Synchronous Telegram sender using HTTP API with exponential backoff.
-    Using direct requests so any thread can call this safely.
-    """
-    url = f"{TELEGRAM_API_BASE}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode}
-    backoff = 1
-    while True:
+session = requests.Session() session.headers.update({"User-Agent": "AirdropVision/Offchain (+https://github.com)"})
+
+----------------- TELEGRAM SENDER -----------------
+
+def send_telegram_sync(text: str, parse_mode: str = "Markdown") -> bool: if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: logger.warning("Telegram not configured: missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID") return False
+
+url = f"{TELEGRAM_API_BASE}/sendMessage"
+payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode}
+backoff = 1
+while True:
+    try:
+        r = session.post(url, json=payload, timeout=10)
+    except requests.RequestException as e:
+        logger.warning("Telegram request exception: %s", e)
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+        continue
+
+    if r.status_code == 200:
+        time.sleep(TELEGRAM_SEND_DELAY_SEC)
+        return True
+
+    if r.status_code == 429:
         try:
-            r = session.post(url, json=payload, timeout=10)
-        except requests.RequestException as e:
-            logger.warning("Telegram request exception: %s", e)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-            continue
+            body = r.json()
+            retry_after = int(body.get("parameters", {}).get("retry_after", 5))
+        except Exception:
+            retry_after = backoff
+        logger.warning("Telegram rate-limited. retry_after=%s", retry_after)
+        time.sleep(retry_after)
+        backoff = min(backoff * 2, 60)
+        continue
 
-        if r.status_code == 200:
-            time.sleep(TELEGRAM_SEND_DELAY_SEC)
-            return True
+    logger.error("Telegram send failed: %s %s", r.status_code, r.text)
+    return False
 
-        if r.status_code == 429:
-            try:
-                body = r.json()
-                retry_after = int(body.get("parameters", {}).get("retry_after", 5))
-            except Exception:
-                retry_after = backoff
-            logger.warning("Telegram rate-limited. retry_after=%s", retry_after)
-            time.sleep(retry_after)
-            backoff = min(backoff * 2, 60)
-            continue
+----------------- NFTCalendar scanner -----------------
 
-        logger.error("Telegram send failed: %s %s", r.status_code, r.text)
-        return False
+def scan_nftcalendar(limit: int = MAX_RESULTS): logger.info("Scanning NFTCalendar: %s (limit=%s)", NFTCALENDAR_API, limit) try: r = session.get(NFTCALENDAR_API, timeout=12) if r.status_code != 200: logger.warning("nftcalendar API returned %s", r.status_code) return data = r.json() items = data.get("nfts") or data.get("data") or data if not isinstance(items, list): logger.debug("Unexpected nftcalendar response shape: %s", type(items)) return except Exception as e: logger.warning("nftcalendar request failed: %s", e) return
 
-# ----------------- ERC20 PROBE -----------------
-def probe_erc20_metadata(contract_address: str, w3: Web3):
-    if not contract_address:
-        return {}
-    try:
-        abi = [
-            {"constant": True, "inputs": [], "name": "name", "outputs": [{"name": "", "type": "string"}], "type": "function"},
-            {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
-            {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"}
-        ]
-        c = w3.eth.contract(address=w3.to_checksum_address(contract_address), abi=abi)
-        name = None
-        symbol = None
-        decimals = None
-        try: name = c.functions.name().call()
-        except: pass
-        try: symbol = c.functions.symbol().call()
-        except: pass
-        try: decimals = c.functions.decimals().call()
-        except: pass
-        return {"name": name, "symbol": symbol, "decimals": decimals}
-    except Exception as e:
-        logger.debug("ERC20 probe failed: %s", e)
-        return {}
+count = 0
+for nft in items:
+    if count >= limit:
+        break
+    nft_id = None
+    if isinstance(nft, dict):
+        nft_id = str(nft.get("id") or nft.get("slug") or (nft.get("name") or "") + "|" + str(nft.get("launch_date") or ""))
+    else:
+        nft_id = str(nft)
+    if not nft_id:
+        continue
 
-# ----------------- CHAIN SCANNERS -----------------
-def scan_chain_for_contract_creations(w3: Web3, chain_name: str, meta_key: str):
-    """
-    Synchronous scan of a small range of blocks for contract creation txs.
-    Records tx hash in DB 'seen' table.
-    """
-    try:
-        latest = w3.eth.block_number
-    except Exception as e:
-        logger.error("Failed to get latest block for %s: %s", chain_name, e)
-        return
+    name = (nft.get("name") or "") if isinstance(nft, dict) else ""
+    desc = (nft.get("description") or "") if isinstance(nft, dict) else ""
+    mint_price = nft.get("mint_price") if isinstance(nft, dict) else None
+    is_free_flag = nft.get("is_free") if isinstance(nft, dict) else None
 
-    last = db.meta_get(meta_key)
-    try:
-        last = int(last) if last is not None else latest - 1
-    except Exception:
-        last = latest - 1
+    likely_free = False
+    if is_free_flag in (True, "true", "True"):
+        likely_free = True
+    if "free" in (name or "").lower() or "free" in (desc or "").lower():
+        likely_free = True
+    if str(mint_price).strip() in ("0", "0.0", "0eth", "0.0eth", "0 wei"):
+        likely_free = True
 
-    start = last + 1
-    end = min(latest, start + MAX_BLOCKS_PER_CYCLE - 1)
-    if start > end:
-        db.meta_set(meta_key, str(latest))
-        return
+    seen_key = f"nftcal:{nft_id}"
+    if db.seen_add(seen_key, kind="nftcalendar", meta=nft):
+        url = nft.get("url") if isinstance(nft, dict) else None
+        date = nft.get("launch_date") if isinstance(nft, dict) else None
+        tag = "FREE MINT" if likely_free else "Upcoming"
+        msg = f"🎨 {tag}: *{nft.get('name') or nft_id}*\nDate: {date}\nLink: {url or 'N/A'}"
+        send_telegram_sync(msg)
+        count += 1
 
-    logger.info("Scanning %s blocks %s..%s", chain_name, start, end)
+----------------- Nitter scraper -----------------
 
-    for bn in range(start, end + 1):
-        try:
-            block = w3.eth.get_block(bn, full_transactions=True)
-        except Exception as e:
-            logger.warning("%s block %s failed: %s", chain_name, bn, e)
-            continue
+def parse_nitter_search_html(html: str, base_url: str) -> List[dict]: soup = BeautifulSoup(html, "lxml") results = [] for a in soup.find_all("a", href=True): href = a["href"] parts = href.split("/") if len(parts) >= 4 and parts[2] in ("status", "statuses"): try: tweet_id = parts[3] except Exception: continue user = parts[1] if len(parts) > 1 else None tweet_url = urllib.parse.urljoin(base_url, href) parent = a.find_parent() text = "" if parent: content_div = parent.find("div", class_="tweet-content") or parent.find("div", class_="content") if content_div: text = content_div.get_text(" ", strip=True) results.append({"id": tweet_id, "user": user, "url": tweet_url, "text": text}) dedup = [] seen_ids = set() for r in results: if r["id"] not in seen_ids: dedup.append(r) seen_ids.add(r["id"]) return dedup
 
-        for tx in block.transactions:
-            if tx.to is None:  # contract creation
-                tx_hash = tx.hash.hex()
-                if db.seen_add(tx_hash, kind=f"{chain_name}_contract_tx"):
-                    # attempt to get contract address from receipt
-                    try:
-                        receipt = w3.eth.get_transaction_receipt(tx_hash)
-                        contract_addr = receipt.contractAddress
-                    except Exception:
-                        contract_addr = None
+def scan_nitter_for_queries(queries: List[str], limit_per_query: int = 10): headers = {"User-Agent": "AirdropVision/Offchain (+https://github.com)"} for instance in NITTER_INSTANCES: try: logger.info("Trying Nitter instance: %s", instance) working = False total_found = 0 for q in queries: q_enc = urllib.parse.quote(q) url = f"{instance}/search?f=tweets&q={q_enc}" try: r = session.get(url, headers=headers, timeout=12) if r.status_code != 200: logger.debug("Nitter %s returned %s for query %s", instance, r.status_code, q) continue parsed = parse_nitter_search_html(r.text, instance) if not parsed: logger.debug("Nitter %s parse returned 0 results for %s", instance, q) continue working = True for tweet in parsed[:limit_per_query]: tweet_id = tweet["id"] seen_key = f"tweet:{tweet_id}" if db.seen_add(seen_key, kind="nitter", meta=tweet): txt = (tweet.get("text") or "").lower() tag = "FREE MINT" if "free mint" in txt or "free-mint" in txt or "free mint nft" in txt else ("AIRDROP" if "airdrop" in txt else "TWEET") msg = f"🐦 {tag}: {tweet.get('user') or 'user'}\n{tweet.get('text') or ''}\nLink: {tweet.get('url')}" send_telegram_sync(msg) total_found += 1 time.sleep(0.25) time.sleep(1.0) except Exception as e: logger.debug("Nitter fetch error for %s: %s", url, e) continue if working: logger.info("Nitter instance %s worked, found %s new items", instance, total_found) return except Exception as e: logger.debug("Nitter instance %s failed: %s", instance, e) continue
 
-                    metadata = probe_erc20_metadata(contract_addr, w3) if contract_addr else {}
-                    msg = (
-                        f"🟢 New {chain_name} contract\n"
-                        f"Tx: `{tx_hash}`\n"
-                        f"Contract: `{contract_addr}`\n"
-                        f"Name: {metadata.get('name')}\n"
-                        f"Symbol: {metadata.get('symbol')}"
-                    )
-                    send_telegram_sync(msg)
+----------------- SCHEDULER -----------------
 
-    db.meta_set(meta_key, str(end))
+def scheduler_loop(): logger.info("Scheduler thread started, interval=%s minute(s)", POLL_INTERVAL_MINUTES) while True: try: scan_nftcalendar(limit=MAX_RESULTS) scan_nitter_for_queries(NITTER_SEARCH_QUERIES, limit_per_query=min(10, MAX_RESULTS)) logger.info("Scheduler cycle finished. Seen=%s", db.seen_count()) except Exception as e: logger.exception("Scheduler error: %s", e) time.sleep(POLL_INTERVAL_MINUTES * 60)
 
-async def solana_rpc_get(client: SolanaClient, limit: int):
-    resp = await client.get_signatures_for_address("So11111111111111111111111111111111111111112", limit=limit)
-    if not isinstance(resp, dict):
-        return None
-    return resp.get("result")
+----------------- TELEGRAM COMMANDS -----------------
 
-def scan_solana_sync(limit: int = MAX_RESULTS):
-    """
-    Wrap async Solana scanning in sync call for the scheduler thread.
-    """
-    try:
-        # prefer primary, fall back to fallback
-        results = asyncio.run(_scan_solana_async(SOLANA_RPC, limit))
-        if not results and SOLANA_RPC_FALLBACK and SOLANA_RPC_FALLBACK != SOLANA_RPC:
-            results = asyncio.run(_scan_solana_async(SOLANA_RPC_FALLBACK, limit))
-        if not results:
-            logger.warning("Solana RPC returned no results")
-            return
-        for tx in results:
-            sig = tx.get("signature")
-            if sig and db.seen_add(sig, "solana_sig"):
-                send_telegram_sync(f"🌞 New Solana signature: `{sig}`")
-    except Exception as e:
-        logger.error("Solana scan sync failed: %s", e)
+def start_cmd(update: Update, context: CallbackContext): keyboard = [[InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")]] text = f"🤖 {BOT_NAME} v{VERSION}\nPolling every {POLL_INTERVAL_MINUTES}m\nSeen: {db.seen_count()}" update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-async def _scan_solana_async(rpc_url: str, limit: int):
-    try:
-        async with SolanaClient(rpc_url) as client:
-            return await solana_rpc_get(client, limit)
-    except Exception as e:
-        logger.debug("Solana async client error (%s): %s", rpc_url, e)
-        return None
+def callback_handler(update: Update, context: CallbackContext): query = update.callback_query if not query: return query.answer() if query.data == "stats": query.edit_message_text(f"📊 {BOT_NAME} v{VERSION}\nTracked: {db.seen_count()} items.") elif query.data == "scan_now": query.edit_message_text("⏳ Manual scan started...") threading.Thread(target=scan_nftcalendar, kwargs={"limit": MAX_RESULTS}, daemon=True).start() threading.Thread(target=scan_nitter_for_queries, args=(NITTER_SEARCH_QUERIES, min(10, MAX_RESULTS)), daemon=True).start() query.edit_message_text("✅ Manual scan started.")
 
-# ----------------- SCHEDULER (background thread) -----------------
-def scheduler_loop():
-    logger.info("Scheduler thread started, interval=%s minute(s)", POLL_INTERVAL_MINUTES)
-    while True:
-        try:
-            scan_chain_for_contract_creations(w3_eth, "Ethereum", "last_eth_block")
-            scan_chain_for_contract_creations(w3_poly, "Polygon", "last_poly_block")
-            scan_solana_sync(MAX_RESULTS)
-            logger.info("Scheduler cycle finished. Seen=%s", db.seen_count())
-        except Exception as e:
-            logger.exception("Scheduler error: %s", e)
-        # sleep
-        time.sleep(POLL_INTERVAL_MINUTES * 60)
+----------------- FLASK health app -----------------
 
-# ----------------- TELEGRAM COMMANDS -----------------
-def start_cmd(update: Update, context: CallbackContext):
-    keyboard = [[InlineKeyboardButton("📊 Stats", callback_data="stats"),
-                 InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")]]
-    text = f"🤖 {BOT_NAME} v{VERSION}\nPolling every {POLL_INTERVAL_MINUTES}m\nSeen: {db.seen_count()}"
-    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+flask_app = Flask(name)
 
-def callback_handler(update: Update, context: CallbackContext):
-    query = update.callback_query
-    if not query:
-        return
-    query.answer()
-    if query.data == "stats":
-        query.edit_message_text(f"📊 {BOT_NAME} v{VERSION}\nTracked: {db.seen_count()} items.")
-    elif query.data == "scan_now":
-        query.edit_message_text("⏳ Running manual scan...")
-        # do quick scans in background so callback returns quickly
-        threading.Thread(target=scan_chain_for_contract_creations, args=(w3_eth, "Ethereum", "last_eth_block"), daemon=True).start()
-        threading.Thread(target=scan_chain_for_contract_creations, args=(w3_poly, "Polygon", "last_poly_block"), daemon=True).start()
-        threading.Thread(target=scan_solana_sync, daemon=True).start()
-        query.edit_message_text("✅ Manual scan started.")
+@flask_app.route("/health") def health(): return "OK", 200
 
-# ----------------- FLASK health app (background thread) -----------------
-flask_app = Flask(__name__)
+def run_flask(): port = int(os.environ.get("PORT", 8080)) flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-@flask_app.route("/health")
-def health():
-    return "OK", 200
+----------------- MAIN -----------------
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    # Flask dev server is okay for Railway health endpoints (not public heavy use)
-    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+def main(): if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: logger.error("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set") return
 
-# ----------------- MAIN -----------------
-def main():
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set")
-        return
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
+logger.info("Flask health thread started")
 
-    # Start Flask thread (so Railway/Render can healthcheck)
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("Flask health thread started")
+sched_thread = threading.Thread(target=scheduler_loop, daemon=True)
+sched_thread.start()
+logger.info("Scheduler thread started")
 
-    # Start scheduler thread
-    sched_thread = threading.Thread(target=scheduler_loop, daemon=True)
-    sched_thread.start()
-    logger.info("Scheduler thread started")
+updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+dp = updater.dispatcher
+dp.add_handler(CommandHandler("start", start_cmd))
+dp.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Start Telegram Updater in main thread (PTB 13)
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start_cmd))
-    dp.add_handler(CallbackQueryHandler(callback_handler))
+logger.info("Starting Telegram polling (main thread).")
+try:
+    updater.start_polling()
+    updater.idle()
+except Exception as e:
+    logger.exception("Updater error: %s", e)
+finally:
+    logger.info("Shutting down.")
 
-    logger.info("Starting Telegram polling (main thread).")
-    try:
-        updater.start_polling()
-        updater.idle()
-    except Exception as e:
-        logger.exception("Updater error: %s", e)
-    finally:
-        logger.info("Shutting down.")
-
-if __name__ == "__main__":
-    main()
+if name == "main": main()
