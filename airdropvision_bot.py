@@ -33,7 +33,7 @@ import os import json import sqlite3 import time import logging import threading
 
 ----------------- CONFIG -----------------
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "1"))  # minutes MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25")) BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision — Offchain") VERSION = os.environ.get("VERSION", "1.0.0") DB_PATH = os.environ.get("DB_PATH", "airdropvision_offchain.db")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "1"))  # minutes MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25")) BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision") VERSION = os.environ.get("VERSION", "1.0.0") DB_PATH = os.environ.get("DB_PATH", "airdropvision_offchain.db")
 
 NFTCALENDAR_API = os.environ.get("NFTCALENDAR_API", "https://api.nftcalendar.io/upcoming")
 
@@ -49,7 +49,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 ----------------- DB -----------------
 
-CREATE_SEEN_SQL = """ CREATE TABLE IF NOT EXISTS seen ( id TEXT PRIMARY KEY, kind TEXT, meta TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ); """ CREATE TABLE IF NOT EXISTS seen ( id TEXT PRIMARY KEY, kind TEXT, meta TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ); """ CREATE_META_SQL = """ CREATE TABLE IF NOT EXISTS meta ( k TEXT PRIMARY KEY, v TEXT ); """ CREATE TABLE IF NOT EXISTS meta ( k TEXT PRIMARY KEY, v TEXT ); """
+CREATE_SEEN_SQL = """ CREATE TABLE IF NOT EXISTS seen ( id TEXT PRIMARY KEY, kind TEXT, meta TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ); """
+
+CREATE_META_SQL = """ CREATE TABLE IF NOT EXISTS meta ( k TEXT PRIMARY KEY, v TEXT ); """ = """ CREATE TABLE IF NOT EXISTS meta ( k TEXT PRIMARY KEY, v TEXT ); """ CREATE TABLE IF NOT EXISTS meta ( k TEXT PRIMARY KEY, v TEXT ); """
 
 class DB: def init(self, path=DB_PATH): self.conn = sqlite3.connect(path, check_same_thread=False) self.conn.execute(CREATE_SEEN_SQL) self.conn.execute(CREATE_META_SQL) self.conn.commit() self._lock = threading.Lock()
 
