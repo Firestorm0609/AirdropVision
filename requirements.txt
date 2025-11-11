@@ -1,7 +1,6 @@
-# Python package dependencies for AirdropVision
+aiosqlite
 python-telegram-bot
 httpx
 beautifulsoup4
+flask
 lxml
-Flask
-
