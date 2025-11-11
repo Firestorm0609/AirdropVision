@@ -1,29 +1,19 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
+k# --- Secrets ---
+# Never commit your .env file with tokens
+.env
 
-# Virtual environment
+# --- Database ---
+# Don't commit the bot's state database
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# --- Python ---
+# Ignore Python cache and virtual environments
+__pycache__/
+*.pyc
 .venv/
 venv/
 env/
 
-# Environment variables
-.env
-*.env
-
-# Railway / build artifacts
-*.log
-*.pid
-
-# SQLite database
-*.db
-*.sqlite3
-
-# MacOS
-.DS_Store
-
-# VSCode
-.vscode/

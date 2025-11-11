@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-AirdropVision — Off-chain bot (NFTCalendar + Nitter)
+AirdropVision — Off-chain bot (NFTCalendar + Nitter) [Async Version]
 
 Scans nftcalendar.io upcoming API for free-mints and upcoming drops
 Scrapes public Nitter instances for tweets matching free-mint / airdrop queries (no X API)
 SQLite persistence (seen items + meta)
 Flask health endpoint (for hosting healthchecks)
-Telegram alerts (python-telegram-bot PTB v13)
-Background scheduler thread
+Telegram alerts (python-telegram-bot PTB v20+)
+Async scheduler (asyncio)
 """
 
 import os
@@ -16,22 +16,29 @@ import sqlite3
 import time
 import logging
 import threading
-import requests
+import httpx  # Async HTTP client
+import asyncio
 import urllib.parse
 from typing import Optional, List
 from datetime import datetime
 from bs4 import BeautifulSoup
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
 
 # ----------------- CONFIG -----------------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "1"))  # minutes
+POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "1"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = os.environ.get("VERSION", "1.0.0")
+VERSION = os.environ.get("VERSION", "2.0.0-async")  # Updated version
 DB_PATH = os.environ.get("DB_PATH", "airdropvision_offchain.db")
 
 NFTCALENDAR_API = os.environ.get("NFTCALENDAR_API", "https://api.nftcalendar.io/upcoming")
@@ -50,12 +57,19 @@ NITTER_SEARCH_QUERIES = [
 ]
 
 TELEGRAM_SEND_DELAY_SEC = float(os.environ.get("TELEGRAM_SEND_DELAY_SEC", "0.8"))
+TELEGRAM_RETRY_MAX = 5  # Max retries for failed sends
+HTTP_TIMEOUT = 12  # Timeout for all HTTP requests
 
 # ----------------- LOGGING -----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(BOT_NAME)
 
 # ----------------- DB -----------------
+# NOTE: This DB class remains synchronous and thread-safe.
+# This is acceptable because SQLite I/O is very fast and won't
+# significantly block the async event loop.
+# Using 'check_same_thread=False' is necessary to allow access
+# from the main asyncio thread and the Flask thread.
 CREATE_SEEN_SQL = """
 CREATE TABLE IF NOT EXISTS seen (
     id TEXT PRIMARY KEY,
@@ -76,7 +90,6 @@ CREATE TABLE IF NOT EXISTS meta (
 class DB:
     def __init__(self, path=DB_PATH):
         self.path = path
-        # ensure directory exists if a dir was included
         base_dir = os.path.dirname(os.path.abspath(path))
         if base_dir and base_dir != "/" and not os.path.exists(base_dir):
             try:
@@ -87,13 +100,15 @@ class DB:
         self.conn.execute(CREATE_SEEN_SQL)
         self.conn.execute(CREATE_META_SQL)
         self.conn.commit()
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # Use threading.Lock for cross-thread safety
 
     def seen_add(self, id: str, kind: str = "generic", meta: Optional[dict] = None) -> bool:
         with self._lock:
             try:
-                self.conn.execute("INSERT INTO seen(id, kind, meta) VALUES (?, ?, ?)",
-                                  (id, kind, json.dumps(meta or {})))
+                self.conn.execute(
+                    "INSERT INTO seen(id, kind, meta) VALUES (?, ?, ?)",
+                    (id, kind, json.dumps(meta or {})),
+                )
                 self.conn.commit()
                 return True
             except sqlite3.IntegrityError:
@@ -118,12 +133,17 @@ class DB:
 
 db = DB()
 
-# ----------------- SESSION -----------------
-session = requests.Session()
-session.headers.update({"User-Agent": "AirdropVision/Offchain (+https://github.com)"})
+# ----------------- HTTPX SESSION -----------------
+# Global async client with headers
+http_client = httpx.AsyncClient(
+    headers={"User-Agent": "AirdropVision/Offchain (+https://github.com)"},
+    timeout=HTTP_TIMEOUT,
+    follow_redirects=True,
+)
 
-# ----------------- TELEGRAM SENDER -----------------
-def send_telegram_sync(text: str, parse_mode: str = "Markdown") -> bool:
+# ----------------- TELEGRAM SENDER (Async) -----------------
+# This standalone sender is used by the scheduler
+async def send_telegram_async(text: str, parse_mode: str = "Markdown") -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram not configured: missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID")
         return False
@@ -131,39 +151,48 @@ def send_telegram_sync(text: str, parse_mode: str = "Markdown") -> bool:
     TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
     url = f"{TELEGRAM_API_BASE}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode}
+
     backoff = 1
-    while True:
+    retries = 0
+    while retries < TELEGRAM_RETRY_MAX:
         try:
-            r = session.post(url, json=payload, timeout=10)
-        except requests.RequestException as e:
+            r = await http_client.post(url, json=payload)
+        except httpx.RequestError as e:
             logger.warning("Telegram request exception: %s", e)
-            time.sleep(backoff)
+            await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
+            retries += 1
             continue
 
         if r.status_code == 200:
-            time.sleep(TELEGRAM_SEND_DELAY_SEC)
+            await asyncio.sleep(TELEGRAM_SEND_DELAY_SEC)
             return True
 
-        if r.status_code == 429:
+        if r.status_code == 429:  # Rate limited
             try:
                 body = r.json()
                 retry_after = int(body.get("parameters", {}).get("retry_after", 5))
             except Exception:
                 retry_after = backoff
             logger.warning("Telegram rate-limited. retry_after=%s", retry_after)
-            time.sleep(retry_after)
+            await asyncio.sleep(retry_after)
             backoff = min(backoff * 2, 60)
+            # Don't increment retries on a 429, as it's an explicit instruction
             continue
 
-        logger.error("Telegram send failed: %s %s", r.status_code, r.text)
-        return False
+        # Other fatal errors (e.g., 400 Bad Request, 403 Forbidden)
+        logger.error("Telegram send failed (fatal): %s %s", r.status_code, r.text)
+        return False  # Give up on fatal errors
 
-# ----------------- NFTCalendar scanner -----------------
-def scan_nftcalendar(limit: int = MAX_RESULTS):
+    logger.error("Telegram send failed after max retries.")
+    return False
+
+
+# ----------------- NFTCalendar scanner (Async) -----------------
+async def scan_nftcalendar(limit: int = MAX_RESULTS):
     logger.info("Scanning NFTCalendar: %s (limit=%s)", NFTCALENDAR_API, limit)
     try:
-        r = session.get(NFTCALENDAR_API, timeout=12)
+        r = await http_client.get(NFTCALENDAR_API)
         if r.status_code != 200:
             logger.warning("nftcalendar API returned %s", r.status_code)
             return
@@ -182,7 +211,11 @@ def scan_nftcalendar(limit: int = MAX_RESULTS):
             break
         nft_id = None
         if isinstance(nft, dict):
-            nft_id = str(nft.get("id") or nft.get("slug") or (nft.get("name") or "") + "|" + str(nft.get("launch_date") or ""))
+            nft_id = str(
+                nft.get("id")
+                or nft.get("slug")
+                or (nft.get("name") or "") + "|" + str(nft.get("launch_date") or "")
+            )
         else:
             nft_id = str(nft)
         if not nft_id:
@@ -198,24 +231,41 @@ def scan_nftcalendar(limit: int = MAX_RESULTS):
             likely_free = True
         if "free" in (name or "").lower() or "free" in (desc or "").lower():
             likely_free = True
-        if mint_price is not None and str(mint_price).strip().lower() in ("0", "0.0", "0eth", "0.0eth", "0 wei", "0wei"):
+        if mint_price is not None and str(mint_price).strip().lower() in (
+            "0",
+            "0.0",
+            "0eth",
+            "0.0eth",
+            "0 wei",
+            "0wei",
+        ):
             likely_free = True
 
         seen_key = f"nftcal:{nft_id}"
+        # DB call is blocking, but very fast.
         if db.seen_add(seen_key, kind="nftcalendar", meta=nft):
-            url = (nft.get("url") if isinstance(nft, dict) else None) or nft.get("link") if isinstance(nft, dict) else None
+            url = (
+                (nft.get("url") if isinstance(nft, dict) else None)
+                or nft.get("link")
+                if isinstance(nft, dict)
+                else None
+            )
             date = nft.get("launch_date") if isinstance(nft, dict) else None
             tag = "FREE MINT" if likely_free else "Upcoming"
             msg = f"🎨 {tag}: *{nft.get('name') or nft_id}*\n\nDate: {date or 'N/A'}\nLink: {url or 'N/A'}"
-            send_telegram_sync(msg)
+            await send_telegram_async(msg)
             count += 1
 
-# ----------------- Nitter scraper -----------------
+
+# ----------------- Nitter scraper (Async) -----------------
+# This parser function itself is not async, as it's just CPU-bound string processing
 def parse_nitter_search_html(html: str, base_url: str) -> List[dict]:
     soup = BeautifulSoup(html, "lxml")
     results = []
     # Prefer to iterate over tweets blocks if present
-    tweet_blocks = soup.find_all("div", class_="timeline-item") or soup.find_all("div", class_="tweet")
+    tweet_blocks = soup.find_all("div", class_="timeline-item") or soup.find_all(
+        "div", class_="tweet"
+    )
     if not tweet_blocks:
         # fallback: scan anchors
         for a in soup.find_all("a", href=True):
@@ -232,7 +282,9 @@ def parse_nitter_search_html(html: str, base_url: str) -> List[dict]:
                 parent = a.find_parent()
                 text = ""
                 if parent:
-                    content_div = parent.find("div", class_="tweet-content") or parent.find("div", class_="content")
+                    content_div = parent.find(
+                        "div", class_="tweet-content"
+                    ) or parent.find("div", class_="content")
                     if content_div:
                         text = content_div.get_text(" ", strip=True)
                 results.append({"id": tweet_id, "user": user, "url": tweet_url, "text": text})
@@ -263,8 +315,9 @@ def parse_nitter_search_html(html: str, base_url: str) -> List[dict]:
             seen_ids.add(r["id"])
     return dedup
 
-def scan_nitter_for_queries(queries: List[str], limit_per_query: int = 10):
-    headers = {"User-Agent": "AirdropVision/Offchain (+https://github.com)"}
+
+async def scan_nitter_for_queries(queries: List[str], limit_per_query: int = 10):
+    # Note: Nitter scraping is inherently fragile and may break if HTML changes.
     for instance in NITTER_INSTANCES:
         try:
             logger.info("Trying Nitter instance: %s", instance)
@@ -274,13 +327,25 @@ def scan_nitter_for_queries(queries: List[str], limit_per_query: int = 10):
                 q_enc = urllib.parse.quote(q)
                 url = f"{instance}/search?f=tweets&q={q_enc}"
                 try:
-                    r = session.get(url, headers=headers, timeout=12)
+                    r = await http_client.get(url)
                     if r.status_code != 200:
-                        logger.debug("Nitter %s returned %s for query %s", instance, r.status_code, q)
+                        logger.debug(
+                            "Nitter %s returned %s for query %s",
+                            instance,
+                            r.status_code,
+                            q,
+                        )
                         continue
-                    parsed = parse_nitter_search_html(r.text, instance)
+                    
+                    # Run the CPU-bound parsing in a separate thread to not block the event loop
+                    parsed = await asyncio.to_thread(
+                        parse_nitter_search_html, r.text, instance
+                    )
+                    
                     if not parsed:
-                        logger.debug("Nitter %s parse returned 0 results for %s", instance, q)
+                        logger.debug(
+                            "Nitter %s parse returned 0 results for %s", instance, q
+                        )
                         continue
                     working = True
                     for tweet in parsed[:limit_per_query]:
@@ -288,95 +353,157 @@ def scan_nitter_for_queries(queries: List[str], limit_per_query: int = 10):
                         seen_key = f"tweet:{tweet_id}"
                         if db.seen_add(seen_key, kind="nitter", meta=tweet):
                             txt = (tweet.get("text") or "").lower()
-                            tag = "FREE MINT" if ("free mint" in txt or "free-mint" in txt or "free mint nft" in txt) else ("AIRDROP" if "airdrop" in txt else "TWEET")
+                            tag = (
+                                "FREE MINT"
+                                if (
+                                    "free mint" in txt
+                                    or "free-mint" in txt
+                                    or "free mint nft" in txt
+                                )
+                                else ("AIRDROP" if "airdrop" in txt else "TWEET")
+                            )
                             msg = f"🐦 {tag}: @{tweet.get('user') or 'user'} {tweet.get('text') or ''}\nLink: {tweet.get('url')}"
-                            send_telegram_sync(msg)
+                            await send_telegram_async(msg)
                             total_found += 1
-                            time.sleep(0.25)
+                            await asyncio.sleep(0.25)
                     # small pause between queries
-                    time.sleep(1.0)
+                    await asyncio.sleep(1.0)
                 except Exception as e:
                     logger.debug("Nitter fetch error for %s: %s", url, e)
                     continue
             if working:
-                logger.info("Nitter instance %s worked, found %s new items", instance, total_found)
-                return
+                logger.info(
+                    "Nitter instance %s worked, found %s new items",
+                    instance,
+                    total_found,
+                )
+                return  # Success, don't try other instances
         except Exception as e:
             logger.debug("Nitter instance %s failed: %s", instance, e)
             continue
 
-# ----------------- SCHEDULER -----------------
-def scheduler_loop():
-    logger.info("Scheduler thread started, interval=%s minute(s)", POLL_INTERVAL_MINUTES)
+
+# ----------------- SCHEDULER (Async) -----------------
+async def scheduler_loop():
+    logger.info("Scheduler task started, interval=%s minute(s)", POLL_INTERVAL_MINUTES)
     while True:
         try:
-            scan_nftcalendar(limit=MAX_RESULTS)
-            scan_nitter_for_queries(NITTER_SEARCH_QUERIES, limit_per_query=min(10, MAX_RESULTS))
+            await scan_nftcalendar(limit=MAX_RESULTS)
+            await scan_nitter_for_queries(
+                NITTER_SEARCH_QUERIES, limit_per_query=min(10, MAX_RESULTS)
+            )
             logger.info("Scheduler cycle finished. Seen=%s", db.seen_count())
         except Exception as e:
             logger.exception("Scheduler error: %s", e)
-        time.sleep(POLL_INTERVAL_MINUTES * 60)
+        await asyncio.sleep(POLL_INTERVAL_MINUTES * 60)
 
-# ----------------- TELEGRAM COMMANDS -----------------
-def start_cmd(update: Update, context: CallbackContext):
+
+# ----------------- TELEGRAM COMMANDS (PTB v20) -----------------
+manual_scan_lock = asyncio.Lock()
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("📊 Stats", callback_data="stats"),
-         InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")]
+        [
+            InlineKeyboardButton("📊 Stats", callback_data="stats"),
+            InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now"),
+        ]
     ]
     text = f"🤖 {BOT_NAME} v{VERSION}\nPolling every {POLL_INTERVAL_MINUTES}m\nSeen: {db.seen_count()}"
-    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    await update.message.reply_text(
+        text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+    )
 
-def callback_handler(update: Update, context: CallbackContext):
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
-    query.answer()
+    
+    await query.answer()
+    
     if query.data == "stats":
-        query.edit_message_text(f"📊 {BOT_NAME} v{VERSION}\nTracked: {db.seen_count()} items.")
+        await query.edit_message_text(
+            f"📊 {BOT_NAME} v{VERSION}\nTracked: {db.seen_count()} items."
+        )
     elif query.data == "scan_now":
-        query.edit_message_text("⏳ Manual scan started...")
-        threading.Thread(target=scan_nftcalendar, kwargs={"limit": MAX_RESULTS}, daemon=True).start()
-        threading.Thread(target=scan_nitter_for_queries, args=(NITTER_SEARCH_QUERIES, min(10, MAX_RESULTS)), daemon=True).start()
-        query.edit_message_text("✅ Manual scan started.")
+        if manual_scan_lock.locked():
+            await query.edit_message_text(
+                "⏳ A manual scan is already in progress. Please wait."
+            )
+            return
+
+        await query.edit_message_text("⏳ Manual scan starting...")
+
+        # Run the scan in a new task to avoid blocking the handler
+        async def do_scan():
+            async with manual_scan_lock:
+                logger.info("Starting manual scan...")
+                await scan_nftcalendar(limit=MAX_RESULTS)
+                await scan_nitter_for_queries(
+                    NITTER_SEARCH_QUERIES, min(10, MAX_RESULTS)
+                )
+                logger.info("Manual scan finished.")
+                # Send a *new* message on completion
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id, text="✅ Manual scan finished."
+                )
+
+        asyncio.create_task(do_scan())
+
 
 # ----------------- FLASK health app -----------------
+# This remains unchanged, as Flask is a blocking WSGI app
+# and is best run in its own thread.
 flask_app = Flask(__name__)
+
 
 @flask_app.route("/health")
 def health():
     return "OK", 200
 
+
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ----------------- MAIN -----------------
-def main():
+
+# ----------------- MAIN (Async) -----------------
+async def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set")
         return
 
+    # Start Flask in a separate thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info("Flask health thread started")
 
-    sched_thread = threading.Thread(target=scheduler_loop, daemon=True)
-    sched_thread.start()
-    logger.info("Scheduler thread started")
+    # Set up the PTB Application
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start_cmd))
-    dp.add_handler(CallbackQueryHandler(callback_handler))
+    # Add handlers
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CallbackQueryHandler(callback_handler))
 
-    logger.info("Starting Telegram polling (main thread).")
+    # Start the scheduler as a background task in the asyncio event loop
+    asyncio.create_task(scheduler_loop())
+    logger.info("Scheduler task started")
+
+    logger.info("Starting Telegram polling (asyncio main).")
     try:
-        updater.start_polling()
-        updater.idle()
+        await application.run_polling()
     except Exception as e:
-        logger.exception("Updater error: %s", e)
+        logger.exception("Application.run_polling error: %s", e)
     finally:
-        logger.info("Shutting down.")
+        logger.info("Shutting down http_client...")
+        await http_client.aclose()
+        logger.info("Shutdown complete.")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested by user.")
+
