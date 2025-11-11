@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-AirdropVision v2.2 — BEAUTIFUL UI EDITION
-REMOVED: All Scholarship logic.
-REMOVED: All Game logic.
-ADDED: Comprehensive, nested inline menu system for beautiful UI.
+AirdropVision v1.0 — BETA RELEASE
+REMOVED: All Feature Toggles (including Web3 Jobs and Airdrop toggle).
+SIMPLIFIED: Scheduler now only runs Custom Nitter Queries.
+ADDED: Inline buttons for /addquery, /delquery, /addfilter, /delfilter command entry points.
 """
 
 import logging
@@ -40,7 +40,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "10"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = "2.2.0-Beautiful-UI"
+VERSION = "1.0.0-Beta-Release"
 DB_PATH = os.environ.get("DB_PATH", "airdropvision_v5.db")
 HTTP_TIMEOUT = 15
 
@@ -57,13 +57,6 @@ DEFAULT_CUSTOM_QUERIES = [
     '("solana airdrop") -filter:replies'
 ]
 
-# --- Feature/Job Config ---
-WEB3_JOBS_QUERIES = {
-    "cm": '"community manager" web3 -"looking for"',
-    "mod": '"community moderator" web3 -"looking for"',
-    "shiller": 'shiller web3 -"looking for"',
-}
-
 # --- Spam Config ---
 DEFAULT_SPAM_KEYWORDS = "giveaway,retweet,follow,tag 3,like,rt,gleam.io,promo,dm me,whatsapp"
 
@@ -73,7 +66,6 @@ HEALTHY_NITTER_INSTANCES: List[str] = []
 NITTER_CHECK_LOCK = asyncio.Lock()
 FILTER_LOCK = asyncio.Lock()
 QUERY_LOCK = asyncio.Lock()
-ENABLED_FEATURES: Dict[str, bool] = {}
 
 # ----------------- LOGGING SETUP -----------------
 logging.basicConfig(
@@ -209,26 +201,6 @@ def is_spam(text: str) -> bool:
     text_low = text.lower()
     return any(w in text_low for w in SPAM_WORDS)
 
-async def load_enabled_features():
-    """Loads feature toggles from DB into the global ENABLED_FEATURES dict."""
-    defaults = {
-        "airdrop": True, 
-        "job_cm": True, "job_mod": True, "job_shiller": True
-    }
-    stored = await db.meta_get_json("enabled_features", defaults)
-    for k, v in defaults.items():
-        if k not in stored: stored[k] = v
-            
-    global ENABLED_FEATURES
-    ENABLED_FEATURES = stored
-    logger.info(f"Loaded feature states: {ENABLED_FEATURES}")
-    
-async def save_enabled_features():
-    await db.meta_set_json("enabled_features", ENABLED_FEATURES)
-
-def is_feature_enabled(key: str) -> bool:
-    return ENABLED_FEATURES.get(key, False)
-
 async def get_custom_nitter_queries() -> List[str]:
     """Retrieves custom queries from DB, setting defaults if none exist."""
     stored = await db.meta_get_json("custom_nitter_queries", [])
@@ -239,7 +211,6 @@ async def get_custom_nitter_queries() -> List[str]:
 
 # ----------------- NITTER/TWITTER -----------------
 def parse_nitter(html: str, base_url: str):
-    # (Same parsing logic as before)
     soup = BeautifulSoup(html, "lxml")
     results = []
     items = soup.find_all("div", class_="timeline-item")
@@ -255,7 +226,6 @@ def parse_nitter(html: str, base_url: str):
     return results
 
 async def check_nitter_health(http_client: httpx.AsyncClient):
-    # (Same health check logic as before)
     logger.info("Checking Nitter instances health...")
     async def check(instance):
         try:
@@ -278,9 +248,10 @@ async def nitter_health_loop(http_client: httpx.AsyncClient):
         await check_nitter_health(http_client)
         await asyncio.sleep(1800) # 30 mins
 
-async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str, feature_key: str):
-    if not is_feature_enabled(feature_key):
-        logger.debug(f"Skipping {feature_key} scan (disabled).")
+async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str):
+    # Feature toggle logic removed, always run scan if queries exist
+    if not queries:
+        logger.debug(f"Skipping {tag} scan (no queries provided).")
         return
 
     async with NITTER_CHECK_LOCK:
@@ -311,29 +282,13 @@ async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], 
                 logger.debug(f"Nitter error {instance}: {e}")
         await asyncio.sleep(2)
 
-# ----------------- WEB3 JOBS -----------------
-async def scan_web3_jobs(http_client: httpx.AsyncClient):
-    job_types = {
-        "job_cm": ("Community Manager", WEB3_JOBS_QUERIES["cm"]),
-        "job_mod": ("Community Moderator", WEB3_JOBS_QUERIES["mod"]),
-        "job_shiller": ("Shiller/Promoter", WEB3_JOBS_QUERIES["shiller"]),
-    }
-    
-    for key, (tag_name, query) in job_types.items():
-        if is_feature_enabled(key):
-            await scan_nitter_query(http_client, [query], f"job_{key}", f"💼 *Web3 Job: {tag_name}*", key)
-        else:
-            logger.debug(f"Skipping Web3 Job: {tag_name} scan (disabled).")
-
 # ----------------- MAIN SCHEDULERS -----------------
 async def scheduler_loop(http_client: httpx.AsyncClient):
     logger.info("Scheduler started.")
     while True:
         try:
             custom_queries = await get_custom_nitter_queries()
-            await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*", "airdrop")
-            
-            await scan_web3_jobs(http_client)
+            await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
             
             count = await db.seen_count()
             logger.info(f"Scan cycle complete. DB Size: {count}")
@@ -345,8 +300,8 @@ async def run_manual_scan(http_client: httpx.AsyncClient, chat_id: int, context)
     await context.bot.send_message(chat_id, "🚀 Manual scan initiated...")
     try:
         custom_queries = await get_custom_nitter_queries()
-        await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*", "airdrop")
-        await scan_web3_jobs(http_client)
+        await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
+        
         await context.bot.send_message(chat_id, "✅ Manual Scan Complete.")
     except Exception as e:
         logger.error(f"Manual scan error: {e}")
@@ -379,8 +334,8 @@ async def get_main_menu():
     text = f"✨ *{BOT_NAME} v{VERSION} | Main Menu*\n\nChoose an option to manage the bot's operation:"
     keyboard = [
         [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
-        [InlineKeyboardButton("🐦 Custom Queries", callback_data="queries_menu"), InlineKeyboardButton("🚫 Spam Filters", callback_data="filters_menu")],
-        [InlineKeyboardButton("⚙️ Feature Toggles", callback_data="features_menu")],
+        [InlineKeyboardButton("🐦 Custom Queries", callback_data="queries_menu")],
+        [InlineKeyboardButton("🚫 Spam Filters", callback_data="filters_menu")],
         [InlineKeyboardButton("🚀 Force Scan Now", callback_data="scan_now")],
     ]
     return text, InlineKeyboardMarkup(keyboard)
@@ -402,35 +357,11 @@ async def get_stats_menu():
     keyboard = [[InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]]
     return text, InlineKeyboardMarkup(keyboard)
 
-FEATURE_MAP = {
-    "airdrop": "Airdrops (Custom Nitter Queries)",
-    "job_cm": "Web3 Job: Community Manager",
-    "job_mod": "Web3 Job: Community Moderator",
-    "job_shiller": "Web3 Job: Shiller/Promoter",
-}
-
-async def get_features_menu():
-    await load_enabled_features()
-    kb = []
-    
-    text = "⚙️ *Feature Toggles*\n\nSelect a scanner to enable or disable its operation."
-    
-    for key, name in FEATURE_MAP.items():
-        status = "✅ On" if is_feature_enabled(key) else "❌ Off"
-        kb.append([InlineKeyboardButton(f"{status} | {name}", callback_data=f"toggle_feature:{key}")])
-        
-    kb.append([InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")])
-    return text, InlineKeyboardMarkup(kb)
-
 async def get_queries_menu():
-    text = (
-        "🐦 *Custom Nitter Queries*\n\n"
-        "Manage the search queries used for the main Airdrop/Mint scan.\n\n"
-        "`/addquery <query>` - Add new query\n"
-        "`/delquery <query>` - Remove a query"
-    )
+    text = "🐦 *Custom Nitter Queries*\n\nManage the search queries used for the bot's scanning."
     kb = [
         [InlineKeyboardButton("📜 View All Queries", callback_data="list_queries")],
+        [InlineKeyboardButton("➕ Add Query", callback_data="add_query_input"), InlineKeyboardButton("➖ Delete Query", callback_data="del_query_input")],
         [InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]
     ]
     return text, InlineKeyboardMarkup(kb)
@@ -438,20 +369,16 @@ async def get_queries_menu():
 async def get_list_queries_menu():
     queries = await get_custom_nitter_queries()
     text = "📜 *Active Nitter Search Queries:*\n\n" + "\n".join([f"• `{q}`" for q in queries])
-    if not queries: text = "No custom queries set. Use `/addquery` to add your first one."
+    if not queries: text = "No custom queries set."
     
     kb = [[InlineKeyboardButton("🔙 Back to Queries Menu", callback_data="queries_menu")]]
     return text, InlineKeyboardMarkup(kb)
 
 async def get_filters_menu():
-    text = (
-        "🚫 *Spam Filters*\n\n"
-        "Keywords added here will block a tweet from being posted.\n\n"
-        "`/addfilter <word>` - Add a filter\n"
-        "`/delfilter <word>` - Remove a filter"
-    )
+    text = "🚫 *Spam Filters*\n\nKeywords added here will block a tweet from being posted."
     kb = [
         [InlineKeyboardButton("📜 View All Filters", callback_data="list_filters")],
+        [InlineKeyboardButton("➕ Add Filter", callback_data="add_filter_input"), InlineKeyboardButton("➖ Delete Filter", callback_data="del_filter_input")],
         [InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]
     ]
     return text, InlineKeyboardMarkup(kb)
@@ -459,9 +386,28 @@ async def get_filters_menu():
 async def get_list_filters_menu():
     await load_spam_words()
     text = "📜 *Active Spam Keywords:*\n\n" + "\n".join([f"• `{w}`" for w in sorted(list(SPAM_WORDS))])
-    if not SPAM_WORDS: text = "No filters set. Use `/addfilter` to add your first one."
+    if not SPAM_WORDS: text = "No filters set."
     
     kb = [[InlineKeyboardButton("🔙 Back to Filters Menu", callback_data="filters_menu")]]
+    return text, InlineKeyboardMarkup(kb)
+
+async def get_command_input_menu(action: str):
+    if action == "add_query":
+        text = "➕ *Add Query*\n\nTo add a query, **type the command** below:\n\n`/addquery <full_twitter_search_query>`"
+        back_data = "queries_menu"
+    elif action == "del_query":
+        text = "➖ *Delete Query*\n\nTo remove a query, **type the command** below:\n\n`/delquery <full_twitter_search_query>`"
+        back_data = "queries_menu"
+    elif action == "add_filter":
+        text = "➕ *Add Filter*\n\nTo add a filter, **type the command** below:\n\n`/addfilter <word>`"
+        back_data = "filters_menu"
+    elif action == "del_filter":
+        text = "➖ *Delete Filter*\n\nTo remove a filter, **type the command** below:\n\n`/delfilter <word>`"
+        back_data = "filters_menu"
+    else:
+        return "Error: Unknown action.", InlineKeyboardMarkup([])
+
+    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data=back_data)]]
     return text, InlineKeyboardMarkup(kb)
 
 # ----------------- COMMAND HANDLERS -----------------
@@ -475,7 +421,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
-# Configuration commands are kept for ease of use, but logic is simplified
+# Configuration commands are kept for ease of use and are the required input method
 async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context): return
     if not context.args:
@@ -483,12 +429,13 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     word = " ".join(context.args).lower().strip()
+    
     async with FILTER_LOCK:
         current = list(SPAM_WORDS)
         if word not in current:
             current.append(word)
             await db.meta_set_json("spam_keywords", current)
-            await load_spam_words() # Reload global state
+            await load_spam_words()
             await update.message.reply_text(f"✅ Added filter: `{word}`. Current count: {len(SPAM_WORDS)}", parse_mode=ParseMode.MARKDOWN)
         else:
             await update.message.reply_text(f"⚠️ Filter `{word}` already exists.", parse_mode=ParseMode.MARKDOWN)
@@ -500,12 +447,13 @@ async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     word = " ".join(context.args).lower().strip()
+    
     async with FILTER_LOCK:
         current = list(SPAM_WORDS)
         if word in current:
             current.remove(word)
             await db.meta_set_json("spam_keywords", current)
-            await load_spam_words() # Reload global state
+            await load_spam_words()
             await update.message.reply_text(f"🗑 Removed filter: `{word}`. Current count: {len(SPAM_WORDS)}", parse_mode=ParseMode.MARKDOWN)
         else:
             await update.message.reply_text(f"⚠️ Filter `{word}` not found.", parse_mode=ParseMode.MARKDOWN)
@@ -517,6 +465,7 @@ async def add_query_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     query = " ".join(context.args).strip()
+    
     async with QUERY_LOCK:
         current = await db.meta_get_json("custom_nitter_queries", [])
         if query not in current:
@@ -533,6 +482,7 @@ async def del_query_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     query = " ".join(context.args).strip()
+    
     async with QUERY_LOCK:
         current = await db.meta_get_json("custom_nitter_queries", [])
         if query in current:
@@ -556,8 +506,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await get_main_menu()
     elif data == "stats":
         text, markup = await get_stats_menu()
-    elif data == "features_menu":
-        text, markup = await get_features_menu()
     elif data == "queries_menu":
         text, markup = await get_queries_menu()
     elif data == "list_queries":
@@ -566,27 +514,23 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await get_filters_menu()
     elif data == "list_filters":
         text, markup = await get_list_filters_menu()
+
+    # Command Input Screens (NEW)
+    elif data == "add_query_input":
+        text, markup = await get_command_input_menu("add_query")
+    elif data == "del_query_input":
+        text, markup = await get_command_input_menu("del_query")
+    elif data == "add_filter_input":
+        text, markup = await get_command_input_menu("add_filter")
+    elif data == "del_filter_input":
+        text, markup = await get_command_input_menu("del_filter")
         
     # Actions
     elif data == "scan_now":
         await query.edit_message_text("🚀 Scanning now... this may take a moment.")
         http_client = context.application.bot_data['http_client']
-        # Start scan in background to avoid callback timeout
         asyncio.create_task(run_manual_scan(http_client, query.message.chat_id, context))
         return # Do not edit message text after starting background task
-        
-    elif data.startswith("toggle_feature:"):
-        key = data.split(":")[1]
-        if key in ENABLED_FEATURES:
-            ENABLED_FEATURES[key] = not ENABLED_FEATURES[key]
-            await save_enabled_features()
-            status_text = "Enabled" if ENABLED_FEATURES[key] else "Disabled"
-            await query.answer(f"{FEATURE_MAP.get(key, key)} set to {status_text}!", show_alert=True)
-        else:
-            await query.answer("Unknown feature.", show_alert=True)
-            
-        # Refresh the features menu
-        text, markup = await get_features_menu()
         
     else:
         logger.warning(f"Unknown callback data: {data}")
@@ -630,7 +574,6 @@ async def main():
         # Init DB and load initial state
         await db.init()
         await load_spam_words()
-        await load_enabled_features()
         await get_custom_nitter_queries() 
 
         # Start the web server
@@ -640,10 +583,8 @@ async def main():
         app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
         app.bot_data['http_client'] = http_client
 
-        # --- Register Handlers ---
+        # --- Register Command Handlers (Input Required) ---
         app.add_handler(CommandHandler("start", start_cmd))
-        
-        # Preserve commands for quick config, although menu is primary UI
         app.add_handler(CommandHandler("addfilter", add_filter_cmd))
         app.add_handler(CommandHandler("delfilter", del_filter_cmd))
         app.add_handler(CommandHandler("addquery", add_query_cmd))
