@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-AirdropVision v1.0 — BETA RELEASE
-REMOVED: All Feature Toggles (including Web3 Jobs and Airdrop toggle).
-SIMPLIFIED: Scheduler now only runs Custom Nitter Queries.
-ADDED: Inline buttons for /addquery, /delquery, /addfilter, /delfilter command entry points.
+AirdropVision v2.4 — MAX INLINE UX EDITION
+ADJUSTED: The four configuration commands (/addquery, /delquery, /addfilter, /delfilter)
+         now use inline buttons to pre-fill the command text into the user's input bar.
 """
 
 import logging
@@ -40,7 +39,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "10"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = "1.0.0-Beta-Release"
+VERSION = "2.4.0-Max-Inline-UX"
 DB_PATH = os.environ.get("DB_PATH", "airdropvision_v5.db")
 HTTP_TIMEOUT = 15
 
@@ -249,7 +248,6 @@ async def nitter_health_loop(http_client: httpx.AsyncClient):
         await asyncio.sleep(1800) # 30 mins
 
 async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str):
-    # Feature toggle logic removed, always run scan if queries exist
     if not queries:
         logger.debug(f"Skipping {tag} scan (no queries provided).")
         return
@@ -392,22 +390,31 @@ async def get_list_filters_menu():
     return text, InlineKeyboardMarkup(kb)
 
 async def get_command_input_menu(action: str):
-    if action == "add_query":
-        text = "➕ *Add Query*\n\nTo add a query, **type the command** below:\n\n`/addquery <full_twitter_search_query>`"
-        back_data = "queries_menu"
-    elif action == "del_query":
-        text = "➖ *Delete Query*\n\nTo remove a query, **type the command** below:\n\n`/delquery <full_twitter_search_query>`"
-        back_data = "queries_menu"
-    elif action == "add_filter":
-        text = "➕ *Add Filter*\n\nTo add a filter, **type the command** below:\n\n`/addfilter <word>`"
-        back_data = "filters_menu"
-    elif action == "del_filter":
-        text = "➖ *Delete Filter*\n\nTo remove a filter, **type the command** below:\n\n`/delfilter <word>`"
-        back_data = "filters_menu"
-    else:
+    # Mapping the action to its command prefix and back button data
+    action_map = {
+        "add_query": {"text": "➕ *Add Query*", "command": "/addquery ", "back": "queries_menu", "tip": "Paste the full search query after the command."},
+        "del_query": {"text": "➖ *Delete Query*", "command": "/delquery ", "back": "queries_menu", "tip": "Paste the exact query to delete after the command."},
+        "add_filter": {"text": "➕ *Add Filter*", "command": "/addfilter ", "back": "filters_menu", "tip": "Type the word(s) you want to block after the command."},
+        "del_filter": {"text": "➖ *Delete Filter*", "command": "/delfilter ", "back": "filters_menu", "tip": "Type the exact word(s) you want to unblock after the command."},
+    }
+    
+    details = action_map.get(action)
+
+    if not details:
         return "Error: Unknown action.", InlineKeyboardMarkup([])
 
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data=back_data)]]
+    text = (
+        f"{details['text']}\n\n"
+        f"1. Tap the button below to **pre-fill the command**.\n"
+        f"2. {details['tip']}\n"
+        f"3. Send the message."
+    )
+    
+    # Create the button that pre-fills the command using switch_inline_query_current_chat
+    kb = [
+        [InlineKeyboardButton(f"⌨️ Type {details['command'].strip()}", switch_inline_query_current_chat=details['command'])],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data=details['back'])]
+    ]
     return text, InlineKeyboardMarkup(kb)
 
 # ----------------- COMMAND HANDLERS -----------------
@@ -421,7 +428,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
-# Configuration commands are kept for ease of use and are the required input method
+# Configuration commands remain the same, as they are the required input method
 async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context): return
     if not context.args:
@@ -515,7 +522,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "list_filters":
         text, markup = await get_list_filters_menu()
 
-    # Command Input Screens (NEW)
+    # Command Input Screens
     elif data == "add_query_input":
         text, markup = await get_command_input_menu("add_query")
     elif data == "del_query_input":
@@ -530,7 +537,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🚀 Scanning now... this may take a moment.")
         http_client = context.application.bot_data['http_client']
         asyncio.create_task(run_manual_scan(http_client, query.message.chat_id, context))
-        return # Do not edit message text after starting background task
+        return 
         
     else:
         logger.warning(f"Unknown callback data: {data}")
