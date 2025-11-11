@@ -541,7 +541,7 @@ async def start_dice_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     context.chat_data[gid]["message_id"] = msg.message_id
     
-async def start_word_scramble(update: Update, context: ContextTypes.DEFAULT_T):
+async def start_word_scramble(update: Update, context: ContextTypes.DEFAULT_TYPE):
     words = ["planet", "python", "network", "scholar", "airdrop", "crypto"]
     word = random.choice(words)
     scrambled = "".join(random.sample(list(word), len(word)))
