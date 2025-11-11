@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 AirdropVision v2.1 — MONOLITHIC AWESOME EDITION (All-in-One File)
-FIXED: Game state management for Dice and Race.
+REMOVED: All Game logic (Dice, Race, Scramble).
+FIXED: Game state management for Dice and Race. (FIXES REMOVED as code is gone)
 ADDED: User-selectable feature enable/disable settings.
 """
 
@@ -19,8 +20,6 @@ from typing import List, Dict, Set, Optional
 # External dependencies
 import aiosqlite
 from bs4 import BeautifulSoup
-
-# Note: Removed the erroneous 'import tkinter as tk' and related lines if they were added.
 from flask import Flask
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -30,7 +29,6 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
     filters,
 )
@@ -442,284 +440,7 @@ async def run_manual_scan(http_client: httpx.AsyncClient, chat_id: int, context)
 
 
 # ----------------------------------------------------------------------
-## 4. 🎮 GAMES LOGIC (FIXED)
-# ----------------------------------------------------------------------
-
-# ----------------- GAME COMMAND ROUTER -----------------
-# (Game logic unchanged, but integrated into this monolithic file)
-async def game_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Router for all /game <name> commands."""
-    if not context.args:
-        await update.message.reply_text("Usage: /game <race|scramble|dice>")
-        return
-        
-    cmd = context.args[0].lower().strip()
-    
-    if cmd == "race":
-        await start_horse_race(update, context)
-    elif cmd == "scramble":
-        await start_word_scramble(update, context)
-    elif cmd == "dice":
-        await start_dice_duel(update, context)
-    else:
-        await update.message.reply_text(f"Unknown game: {cmd}")
-
-# ----------------- GAME CALLBACK ROUTER -----------------
-async def handle_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data_parts: List[str]):
-    """Router for all callbacks starting with 'game:'"""
-    query = update.callback_query
-    
-    action = data_parts[1]
-    
-    # Handle New Game Starts from the Menu (no gid yet)
-    if action == "start_race":
-        await start_horse_race(update, context)
-        return
-    elif action == "start_dice":
-        await start_dice_duel(update, context)
-        return
-    elif action == "start_scramble":
-        await start_word_scramble(update, context)
-        return
-    
-    # --- Existing Game Actions (Requires gid) ---
-    try:
-        gid = data_parts[2]
-    except IndexError:
-        await query.answer("Internal game error (Missing GID).", show_alert=True)
-        return
-
-    if gid not in context.chat_data:
-        # FIX: The core issue was here, updating the message when expired.
-        await query.answer("Game expired or not found. Please start a new one.", show_alert=True)
-        # Check if query.message exists before editing
-        if query.message:
-            await query.edit_message_text("This game has expired. Please start a new one.")
-        return
-        
-    game = context.chat_data[gid]
-    
-    if action == "race_join":
-        await handle_race_join(query, context, game, gid, data_parts)
-    elif action == "race_start":
-        await handle_race_start(query, context, game, gid)
-    elif action == "dice_roll":
-        await handle_dice_roll(query, context, game, gid)
-    elif action == "dice_end":
-        await handle_dice_end(query, context, game, gid)
-
-# ----------------- WORD SCRAMBLE (REPLY HANDLER) -----------------
-async def handle_scramble_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles replies to scramble messages."""
-    if not update.message.reply_to_message:
-        return
-        
-    reply_to_msg_id = update.message.reply_to_message.message_id
-    game_key = f"scramble_ans_{reply_to_msg_id}"
-    
-    if game_key in context.chat_data:
-        game = context.chat_data[game_key]
-        
-        if game["solved"]:
-            await update.message.reply_text("This scramble was already solved!")
-            return
-            
-        answer = game["word"]
-        guess = update.message.text.strip().lower()
-        
-        if guess == answer:
-            game["solved"] = True 
-            user_name = update.message.from_user.first_name
-            await update.message.reply_text(f"🎉 Correct! *{user_name}* solved it!\nThe word was *{answer.upper()}*.", parse_mode=ParseMode.MARKDOWN)
-            del context.chat_data[game_key]
-        else:
-            await update.message.reply_text("Nope, try again!", quote=True)
-
-# ----------------- HORSE RACE (FIXED START) -----------------
-async def start_horse_race(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = f"race:{int(datetime.now().timestamp())}"
-    horses = ["🐎1","🐎2","🐎3","🐎4"]
-    
-    context.chat_data[gid] = {
-        "type": "horse_race", "players": {}, "horses": horses, "message_id": None
-    }
-    
-    kb = [[InlineKeyboardButton(h, callback_data=f"game:race_join:{gid}:{i}") for i, h in enumerate(horses)]]
-    kb.append([InlineKeyboardButton("🏁 Start Race", callback_data=f"game:race_start:{gid}")])
-    
-    source_message = update.callback_query.message if update.callback_query else update.message
-    
-    text = "🐴 *Horse Race!*\nPick a horse. One per player."
-    markup = InlineKeyboardMarkup(kb)
-
-    if update.callback_query:
-        # FIX: Edit the existing menu message if it came from the menu button
-        msg = await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-    else:
-        # Command start is fine with reply_text
-        msg = await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-        
-    context.chat_data[gid]["message_id"] = msg.message_id
-
-async def handle_race_join(query, context, game, gid, data_parts):
-    user = query.from_user
-    horse_idx = int(data_parts[3])
-    
-    if user.id in game['players']:
-        await query.answer("You already picked a horse!", show_alert=True)
-        return
-        
-    game['players'][user.id] = horse_idx
-    await query.answer(f"You picked {game['horses'][horse_idx]}!")
-    
-    player_list = []
-    for uid, h_idx in game['players'].items():
-        try:
-            chat_member = await context.bot.get_chat_member(query.message.chat_id, uid)
-            name = chat_member.user.first_name
-        except:
-            name = f"Player {uid}"
-        player_list.append(f"{game['horses'][h_idx]} ({name})")
-    
-    await query.edit_message_text(
-        f"🐴 *Horse Race!*\nPick a horse.\n\n*Selections:*\n" + "\n".join(player_list),
-        reply_markup=query.message.reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def handle_race_start(query, context, game, gid):
-    if not game['players']:
-        await query.answer("Need at least one player to start!", show_alert=True)
-        return
-        
-    await query.edit_message_text("🏁 *AND THEY'RE OFF!*", reply_markup=None, parse_mode=ParseMode.MARKDOWN)
-    
-    asyncio.create_task(run_race_animation(
-        context, query.message, game['horses'], game['players'], gid
-    ))
-
-async def run_race_animation(context: ContextTypes.DEFAULT_TYPE, message: Message, horses: List[str], players: Dict, gid: str):
-    positions = [0] * len(horses)
-    finish_line = 20
-    
-    while True:
-        await asyncio.sleep(1.0) 
-        race_text = "🏁 *Race in Progress!*\n\n"
-        winners = []
-        
-        for i in range(len(positions)):
-            if positions[i] < finish_line:
-                positions[i] += random.randint(1, 3)
-            
-            track = "─" * positions[i]
-            track = track.ljust(finish_line, " ")
-            race_text += f"`{horses[i]} |{track}|`\n"
-            
-            if positions[i] >= finish_line:
-                winners.append(i)
-        
-        try:
-            await message.edit_text(race_text, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            pass 
-            
-        if winners:
-            break
-            
-    winner_idx = random.choice(winners)
-    winner_horse = horses[winner_idx]
-    
-    winning_players = []
-    for uid, h_idx in players.items():
-        if h_idx == winner_idx:
-            try:
-                chat_member = await context.bot.get_chat_member(message.chat_id, uid)
-                winning_players.append(chat_member.user.first_name)
-            except:
-                winning_players.append(f"A Player (ID: {uid})")
-            
-    winner_text = ", ".join(winning_players) if winning_players else "No one picked the winner."
-    
-    await message.edit_text(
-        f"🎉 *Race Over!*\n\n🏆 Winning Horse: {winner_horse}\n\n👤 Winners: *{winner_text}*", 
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    if gid in context.chat_data:
-        del context.chat_data[gid]
-
-# ----------------- DICE DUEL (FIXED START) -----------------
-async def start_dice_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = f"dice:{int(datetime.now().timestamp())}"
-    context.chat_data[gid] = {
-        "type": "dice", "players": {}, "message_id": None
-    }
-    
-    kb = [
-        [InlineKeyboardButton("🎲 Roll Dice", callback_data=f"game:dice_roll:{gid}")],
-        [InlineKeyboardButton("🏁 End Game", callback_data=f"game:dice_end:{gid}")],
-    ]
-    
-    text = "🎲 *Dice Duel!*\nTap to roll. When done, tap End Game."
-    markup = InlineKeyboardMarkup(kb)
-
-    if update.callback_query:
-        # FIX: Edit the existing menu message if it came from the menu button
-        msg = await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-    else:
-        # Command start is fine with reply_text
-        msg = await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-        
-    context.chat_data[gid]["message_id"] = msg.message_id
-
-async def handle_dice_roll(query, context, game, gid):
-    user = query.from_user
-    roll = random.randint(1, 6) + random.randint(1, 6)
-    game['players'][user.id] = {"name": user.first_name, "roll": roll}
-    
-    await query.answer(f"You rolled a {roll}!")
-    
-    player_list = "\n".join([f"- {p['name']}: {p['roll']}" for p in game['players'].values()])
-    await query.edit_message_text(
-        f"🎲 *Dice Duel!*\nTap to roll.\n\n*Rolls:*\n{player_list}",
-        reply_markup=query.message.reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def handle_dice_end(query, context, game, gid):
-    if not game['players']:
-        await query.edit_message_text("Game ended with no players.")
-    else:
-        winner = max(game['players'].values(), key=lambda p: p['roll'])
-        await query.edit_message_text(
-            f"🎲 *Dice Duel Over!*\n\n🏆 Winner: *{winner['name']}* with a roll of *{winner['roll']}*!",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=None
-        )
-    del context.chat_data[gid]
-
-# ----------------- WORD SCRAMBLE (START) -----------------
-async def start_word_scramble(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    words = ["planet", "python", "network", "scholar", "airdrop", "crypto"]
-    word = random.choice(words)
-    scrambled = "".join(random.sample(list(word), len(word)))
-    
-    source_message = update.callback_query.message if update.callback_query else update.message
-
-    # Scramble is fine with reply_text even from callback as it's meant to start a new thread
-    msg = await source_message.reply_text(
-        f"🧠 *Word Scramble*\n\nUnscramble this word:\n\n`{scrambled.upper()}`\n\nReply to this message with your answer!",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    context.chat_data[f"scramble_ans_{msg.message_id}"] = {
-        "word": word,
-        "solved": False
-    }
-
-
-# ----------------------------------------------------------------------
-## 5. 🤖 TELEGRAM BOT & MAIN COORDINATOR (UPDATED)
+## 4. 🤖 TELEGRAM BOT & MAIN COORDINATOR (UPDATED)
 # ----------------------------------------------------------------------
 
 # ----------------- AUTH HELPER -----------------
@@ -743,7 +464,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context): return
     keyboard = [
         [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("⚙️ Filters", callback_data="filters")],
-        [InlineKeyboardButton("✅ Features", callback_data="features_menu"), InlineKeyboardButton("🎮 Games", callback_data="games_menu")],
+        [InlineKeyboardButton("✅ Features", callback_data="features_menu")],
         [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")],
     ]
     await update.message.reply_text(
@@ -755,7 +476,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_main_menu():
     keyboard = [
         [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("⚙️ Filters", callback_data="filters")],
-        [InlineKeyboardButton("✅ Features", callback_data="features_menu"), InlineKeyboardButton("🎮 Games", callback_data="games_menu")],
+        [InlineKeyboardButton("✅ Features", callback_data="features_menu")],
         [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")],
     ]
     return "🤖 *Main Menu*\nActive & Scanning...", InlineKeyboardMarkup(keyboard)
@@ -930,9 +651,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="filters")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
-    # --- Scholarship Routes ---
+    # --- Scholarship Routes (Optional Menu, mainly uses commands) ---
     elif data == "scholarships_menu":
-        # Note: Scholarship settings is still here for historical reasons, but feature toggle is main
         kb = [
             [InlineKeyboardButton("📜 List Sources", callback_data="list_sch_sources")],
             [InlineKeyboardButton("➕ Add Source (/addschsource)", callback_data="add_sch_info")],
@@ -957,25 +677,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         http_client = context.application.bot_data['http_client']
         await scan_scholarships(http_client)
         await query.message.reply_text("✅ Scholarship scan complete.")
-
-    # --- Game Menu Route ---
-    elif data == "games_menu":
-        kb = [
-            [InlineKeyboardButton("🐴 Horse Race", callback_data="game:start_race")],
-            [InlineKeyboardButton("🎲 Dice Duel", callback_data="game:start_dice")],
-            [InlineKeyboardButton("🧠 Word Scramble", callback_data="game:start_scramble")],
-            [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
-        ]
-        await query.edit_message_text(
-            "🎮 *Mini-Games*\nPick a game to start. (Only playable in this chat.)",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    # --- Game Routes ---
-    elif data.startswith("game:"):
-        await handle_game_callback(update, context, data.split(":"))
-
+        
     else:
         logger.warning(f"Unknown callback data: {data}")
 
@@ -1029,10 +731,11 @@ async def main():
         app.add_handler(CommandHandler("addschsource", add_sch_source_cmd))
         app.add_handler(CommandHandler("listschsources", list_sch_sources_cmd))
         app.add_handler(CommandHandler("scholarships", force_scholarships_cmd))
-        app.add_handler(CommandHandler("game", game_command_handler))
+        
+        # NOTE: Removed CommandHandler("game", game_command_handler)
+        # NOTE: Removed MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_scramble_reply)
 
         app.add_handler(CallbackQueryHandler(callback_router))
-        app.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_scramble_reply))
 
         # --- Background Tasks ---
         health_checker = asyncio.create_task(nitter_health_loop(http_client))
@@ -1054,7 +757,6 @@ async def main():
             logger.error(f"Main loop error: {e}", exc_info=True)
         finally:
             logger.info("Stopping components...")
-            # Ensure application gracefully stops before loop tasks are fully canceled
             await app.updater.stop()
             await app.stop()
             await app.shutdown()
