@@ -2,7 +2,7 @@
 """
 AirdropVision v3.0 — Advanced Async Off-chain Bot
 Features:
-- Sources: NFTCalendar, Nitter (Twitter), Reddit (JSON)
+- Sources: NFTCalendar, Nitter (Twitter)
 - Anti-Spam: Keyword filtering (configurable via Telegram)
 - Resilience: Dynamic Nitter instance health checking
 - Database: Fully Async SQLite (aiosqlite)
@@ -63,10 +63,6 @@ NITTER_SEARCH_QUERIES = [
     '("solana airdrop" OR "sol free mint") -filter:replies',
     '("eth free mint") -filter:replies',
 ]
-
-# Reddit Config
-REDDIT_SUBREDDITS = ["NFTsMarketplace", "NFT", "solana", "CryptoAirdrop"]
-REDDIT_SEARCH_QUERIES = ['("free mint" OR "freemint")', '"airdrop"']
 
 # Spam Defaults
 DEFAULT_SPAM_KEYWORDS = "giveaway,retweet,follow,tag 3,like,rt,gleam.io,promo,dm me,whatsapp,telegram group"
@@ -316,34 +312,6 @@ async def scan_calendar(limit=MAX_RESULTS):
     except Exception as e:
         logger.error(f"Calendar scan error: {e}")
 
-# ----------------- SCANNER: REDDIT (JSON) -----------------
-async def scan_reddit(limit=10):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for sub in REDDIT_SUBREDDITS:
-        for q in REDDIT_SEARCH_QUERIES:
-            try:
-                url = f"https://old.reddit.com/r/{sub}/search.json?q={urllib.parse.quote(q)}&restrict_sr=on&sort=new&limit={limit}"
-                r = await http_client.get(url, headers=headers)
-                if r.status_code != 200: continue
-                
-                posts = r.json().get("data", {}).get("children", [])
-                for post in posts:
-                    data = post.get("data", {})
-                    pid = data.get("id")
-                    title = data.get("title", "")
-                    text = data.get("selftext", "")
-                    link = "https://reddit.com" + data.get("permalink", "")
-                    
-                    if is_spam(title + " " + text): continue
-                    
-                    if await db.seen_add(f"reddit:{pid}", "reddit", data):
-                        msg = f"🤖 *Reddit Scan*\n\n*{title}*\n\n🔗 [Link]({link})"
-                        await send_telegram_async(msg)
-                        await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.debug(f"Reddit error r/{sub}: {e}")
-            await asyncio.sleep(1)
-
 # ----------------- MAIN SCHEDULER -----------------
 async def scheduler_loop():
     logger.info("Scheduler started.")
@@ -351,7 +319,6 @@ async def scheduler_loop():
         try:
             await scan_calendar()
             await scan_nitter()
-            await scan_reddit()
             count = await db.seen_count()
             logger.info(f"Scan cycle complete. DB Size: {count}")
         except Exception as e:
@@ -421,7 +388,6 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def run_manual_scan(chat_id, context):
     await scan_calendar()
     await scan_nitter()
-    await scan_reddit()
     await context.bot.send_message(chat_id, "✅ Manual Scan Complete.")
 
 # --- Command Handlers for Filters ---
