@@ -289,7 +289,7 @@ for q in POKER_TWEET_QUERIES:
                     continue
                 # send poker tweets but tag them so users can distinguish
                 if await db.seen_add(f"poker:{t['id']}", "poker", t):
-                    msg = f"""🃏 *Poker/Tournament*
+                    msg = f""" *Poker/Tournament*
 
 {txt}
 
