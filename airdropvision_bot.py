@@ -295,7 +295,7 @@ for q in POKER_TWEET_QUERIES:
 
 🔗 Link" await send_telegram_async(http_client, msg) await asyncio.sleep(0.5) break except Exception as e: logger.debug(f"Poker scan error {instance}: {e}") await asyncio.sleep(1)
 
-async def poker_twitter_loop(http_client: httpx.AsyncClient): """Background loop that periodically scans for poker tweets.""" while True: try: await scan_poker_tweets(http_client) except Exception as e: logger.debug(f"Poker loop error: {e}") await asyncio.sleep(600)  # 10 minutes
+async def poker_twitter_loop(http_client: httpx.AsyncClient): """Background loop that periodically scans for poker tweets.""" while True: try: await scan_poker_tweets(http_client) except Exception as e: logger.debug(f"Poker loop error: {e}") await asyncio.sleep(600)  # 10 minutes(600)  # 10 minutes
 
 ----------------- MULTIPLAYER GAMES (group-friendly)
 
