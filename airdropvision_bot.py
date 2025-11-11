@@ -472,7 +472,246 @@ async def handle_game_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     # Handle New Game Starts from the Menu (no gid yet)
     if action == "start_race":
         await start_horse_race(update, context)
-        return
+import tkinter as tk
+from tkinter import messagebox
+import random
+
+# --- Configuration & Theme ---
+MAX_HORSES = 10
+COLORS = [
+    "#FF5252", "#448AFF", "#69F0AE", "#E040FB", "#FFAB40", 
+    "#FFD740", "#536DFE", "#18FFFF", "#FF6E40", "#EEFF41"
+]
+BG_COLOR = "#2c2f33"       # Discord Dark
+FG_COLOR = "#ffffff"       # White text
+ACCENT_COLOR = "#7289da"   # Discord Blurple
+TRACK_COLOR = "#23272a"    # Darker track bg
+LANE_HEIGHT = 50
+
+class HorseRaceApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("v1.0 AirdropVision")
+        self.root.geometry("900x600")
+        self.root.configure(bg=BG_COLOR)
+
+        # Game State
+        self.horses = []
+        self.is_racing = False
+        self.finish_order = []
+        self.race_speed_base = 2  # Base movement speed
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        # --- Left Panel (Controls) ---
+        self.control_panel = tk.Frame(self.root, bg=BG_COLOR, width=250, padx=10, pady=10)
+        self.control_panel.pack(side=tk.LEFT, fill=tk.Y)
+
+        # Title
+        tk.Label(self.control_panel, text="AIRDROP\nVISION", font=("Courier", 20, "bold"), 
+                 bg=BG_COLOR, fg="#fcd34d").pack(pady=(0, 20))
+
+        # Input Area
+        tk.Label(self.control_panel, text="Horse Name:", bg=BG_COLOR, fg="#99aab5").pack(anchor="w")
+        self.name_entry = tk.Entry(self.control_panel, bg="#40444b", fg="white", insertbackground="white", relief="flat")
+        self.name_entry.pack(fill=tk.X, pady=5)
+        self.name_entry.bind("<Return>", lambda e: self.add_horse())
+
+        add_btn = tk.Button(self.control_panel, text="+ Add Horse", bg=ACCENT_COLOR, fg="white", 
+                            relief="flat", command=self.add_horse)
+        add_btn.pack(fill=tk.X, pady=5)
+
+        # List of Horses
+        tk.Label(self.control_panel, text="Stables:", bg=BG_COLOR, fg="#99aab5").pack(anchor="w", pady=(20, 5))
+        self.horse_listbox = tk.Listbox(self.control_panel, bg="#23272a", fg="white", 
+                                        height=10, relief="flat", highlightthickness=0)
+        self.horse_listbox.pack(fill=tk.X)
+
+        # Buttons
+        clear_btn = tk.Button(self.control_panel, text="Clear All", bg="#f04747", fg="white", 
+                              relief="flat", command=self.clear_horses)
+        clear_btn.pack(fill=tk.X, pady=5)
+
+        self.start_btn = tk.Button(self.control_panel, text="START RACE 🏁", bg="#43b581", fg="white", 
+                                   font=("Arial", 12, "bold"), relief="flat", command=self.start_race, state="disabled")
+        self.start_btn.pack(fill=tk.X, pady=(20, 5))
+
+        # --- Right Panel (Track) ---
+        self.track_frame = tk.Frame(self.root, bg=TRACK_COLOR)
+        self.track_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        self.canvas = tk.Canvas(self.track_frame, bg=TRACK_COLOR, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Initial Message
+        self.canvas.create_text(300, 250, text="Add horses to begin...", fill="#99aab5", font=("Arial", 16))
+
+    def add_horse(self):
+        name = self.name_entry.get().strip()
+        if not name: name = f"Horse {len(self.horses) + 1}"
+        
+        if len(self.horses) >= MAX_HORSES:
+            messagebox.showwarning("Stable Full", f"Max {MAX_HORSES} horses allowed!")
+            return
+
+        # Assign color based on index
+        color = COLORS[len(self.horses) % len(COLORS)]
+        
+        horse_data = {
+            "name": name,
+            "color": color,
+            "x": 0,
+            "finished": False
+        }
+        self.horses.append(horse_data)
+        
+        # Update UI
+        self.name_entry.delete(0, tk.END)
+        self.update_horse_list()
+        self.draw_track()
+        
+        if len(self.horses) >= 2:
+            self.start_btn.config(state="normal")
+
+    def clear_horses(self):
+        self.horses = []
+        self.update_horse_list()
+        self.draw_track()
+        self.start_btn.config(state="disabled")
+        self.canvas.delete("all")
+        self.canvas.create_text(300, 250, text="Stables Cleared.", fill="#99aab5", font=("Arial", 16))
+
+    def update_horse_list(self):
+        self.horse_listbox.delete(0, tk.END)
+        for h in self.horses:
+            self.horse_listbox.insert(tk.END, f" {h['name']}")
+            # Note: Tkinter listbox doesn't support individual item colors easily without custom code, 
+            # so we stick to text here.
+
+    def draw_track(self):
+        self.canvas.delete("all")
+        w = self.canvas.winfo_width()
+        if w < 100: w = 600 # fallback if not rendered yet
+
+        finish_line_x = w - 50
+
+        for i, horse in enumerate(self.horses):
+            y_pos = i * LANE_HEIGHT + 30
+            
+            # Draw Lane "Dots" (Discord style)
+            self.canvas.create_line(10, y_pos + 20, finish_line_x, y_pos + 20, 
+                                    fill="#40444b", dash=(4, 4), width=2)
+
+            # Draw Horse Name Label
+            self.canvas.create_text(10, y_pos, text=horse['name'], anchor="w", fill="white", font=("Arial", 10))
+
+            # Draw Horse Icon/Shape
+            # We use the emoji text, but we also draw a colored circle behind it to identify them
+            # Position depends on horse['x'] (0 to 100 scale mapped to pixels)
+            
+            px_pos = 20 + (horse['x'] / 100) * (finish_line_x - 40)
+            
+            # The Horse Marker (Circle + Text)
+            self.canvas.create_oval(px_pos, y_pos + 10, px_pos + 20, y_pos + 30, 
+                                    fill=horse['color'], outline="")
+            self.canvas.create_text(px_pos + 10, y_pos + 20, text="🐎", font=("Arial", 14))
+            
+            # Store the ID to move it later? Actually simpler to redraw for this lightweight app
+            
+        # Draw Finish Line
+        self.canvas.create_line(finish_line_x, 0, finish_line_x, len(self.horses) * LANE_HEIGHT + 50, 
+                                fill="#f04747", width=4)
+        self.canvas.create_text(finish_line_x, len(self.horses) * LANE_HEIGHT + 60, 
+                                text="FINISH", fill="#f04747", font=("Arial", 8, "bold"))
+
+    def start_race(self):
+        if self.is_racing: return
+        self.is_racing = True
+        self.finish_order = []
+        
+        # Reset positions
+        for h in self.horses:
+            h['x'] = 0
+            h['finished'] = False
+            
+        self.control_panel.config(cursor="watch") # visual cue
+        self.start_btn.config(state="disabled")
+        self.run_race_step()
+
+    def run_race_step(self):
+        if not self.is_racing: return
+
+        all_finished = True
+        w = self.canvas.winfo_width()
+        finish_line_x = w - 50
+        
+        self.canvas.delete("all")
+        
+        # Redraw Track Static Elements
+        self.canvas.create_line(finish_line_x, 0, finish_line_x, len(self.horses) * LANE_HEIGHT + 50, 
+                                fill="#f04747", width=4)
+        self.canvas.create_text(finish_line_x, len(self.horses) * LANE_HEIGHT + 60, 
+                                text="FINISH", fill="#f04747", font=("Arial", 8, "bold"))
+
+        for i, horse in enumerate(self.horses):
+            y_pos = i * LANE_HEIGHT + 30
+            
+            # Track Line
+            self.canvas.create_line(10, y_pos + 20, finish_line_x, y_pos + 20, 
+                                    fill="#40444b", dash=(4, 4), width=2)
+            
+            if not horse['finished']:
+                # Random Movement Logic
+                step = random.uniform(0.5, 2.0)
+                if random.random() < 0.05: step += 3.0 # Burst of speed
+                
+                horse['x'] += step
+                all_finished = False
+
+                # Check Finish
+                if horse['x'] >= 100:
+                    horse['x'] = 100
+                    horse['finished'] = True
+                    self.finish_order.append(horse)
+            
+            # Draw Horse
+            px_pos = 20 + (horse['x'] / 100) * (finish_line_x - 40)
+            
+            # Name
+            self.canvas.create_text(10, y_pos, text=horse['name'], anchor="w", fill="white", font=("Arial", 10))
+            
+            # Horse Shape
+            self.canvas.create_oval(px_pos, y_pos + 10, px_pos + 20, y_pos + 30, 
+                                    fill=horse['color'], outline="")
+            self.canvas.create_text(px_pos + 10, y_pos + 20, text="🐎", font=("Arial", 14))
+
+        if all_finished:
+            self.end_race()
+        else:
+            # Schedule next frame (approx 30 FPS)
+            self.root.after(30, self.run_race_step)
+
+    def end_race(self):
+        self.is_racing = False
+        self.control_panel.config(cursor="")
+        self.start_btn.config(state="normal")
+        
+        # Show Leaderboard
+        winner = self.finish_order[0]
+        
+        results_text = "🏆 Race Results 🏆\n\n"
+        for idx, h in enumerate(self.finish_order):
+            medal = "🥇" if idx == 0 else "🥈" if idx == 1 else "🥉" if idx == 2 else f"{idx+1}."
+            results_text += f"{medal} {h['name']}\n"
+            
+        messagebox.showinfo("Race Finished!", f"Winner: {winner['name']}\n\n{results_text}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = HorseRaceApp(root)
+    root.mainloop()        return
     elif action == "start_dice":
         await start_dice_duel(update, context)
         return
