@@ -191,7 +191,7 @@ async def scheduler_loop(http_client: httpx.AsyncClient): logger.info("Scheduler
 
 def is_authorized(chat_id: int) -> bool: return str(chat_id) == str(TELEGRAM_CHAT_ID)
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): if not is_authorized(update.effective_chat.id): return await update.message.reply_text("🚫 Unauthorized chat.") keyboard = [ [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("⚙️ Filters", callback_data="filters")], [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now"), InlineKeyboardButton("🃏 Poker", callback_data="poker_start")] ] await update.message.reply_text( f"🤖 {BOT_NAME} v{VERSION}\nActive & Scanning...", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN )
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): if not is_authorized(update.effective_chat.id): return await update.message.reply_text("🚫 Unauthorized chat.") keyboard = [ [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("⚙️ Filters", callback_data="filters")], [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now"), InlineKeyboardButton("🃏 Poker Tweets", callback_data="poker_start")] ] await update.message.reply_text( f"🤖 {BOT_NAME} v{VERSION}\nActive & Scanning...", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN )
 
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE): query = update.callback_query await query.answer() if not is_authorized(query.message.chat_id): return await query.edit_message_text("🚫 Unauthorized chat.") data = query.data http_client = context.application.bot_data['http_client']
 
@@ -235,13 +235,13 @@ elif data == "scan_now":
     asyncio.create_task(run_manual_scan(http_client, query.message.chat_id, context))
 
 elif data == "poker_start":
-    await query.edit_message_text("🃏 Starting Poker (Video Poker - single player)...")
-    asyncio.create_task(start_poker_game(context, query.message.chat_id))
+    await query.edit_message_text("🃏 Scanning for Poker tweets now...")
+    asyncio.create_task(scan_poker_tweets(http_client))
 
 elif data == "main_menu":
     keyboard = [
         [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("⚙️ Filters", callback_data="filters")],
-        [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now"), InlineKeyboardButton("🃏 Poker", callback_data="poker_start")]
+        [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now"), InlineKeyboardButton("🃏 Poker Tweets", callback_data="poker_start")]
     ]
     await query.edit_message_text(f"🤖 *{BOT_NAME} v{VERSION}*\nActive & Scanning...", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
@@ -295,7 +295,7 @@ for q in POKER_TWEET_QUERIES:
 
 🔗 Link" await send_telegram_async(http_client, msg) await asyncio.sleep(0.5) break except Exception as e: logger.debug(f"Poker scan error {instance}: {e}") await asyncio.sleep(1)
 
-async def poker_twitter_loop(http_client: httpx.AsyncClient): """Background loop that periodically scans for poker tweets.""" while True: try: await scan_poker_tweets(http_client) except Exception as e: logger.debug(f"Poker loop error: {e}") await asyncio.sleep(600)  # 10 minutes(600)  # 10 minutes
+async def poker_twitter_loop(http_client: httpx.AsyncClient): """Background loop that periodically scans for poker-related tweets.""" while True: try: await scan_poker_tweets(http_client) except Exception as e: logger.debug(f"Poker loop error: {e}") await asyncio.sleep(600)
 
 ----------------- MULTIPLAYER GAMES (group-friendly)
 
@@ -381,11 +381,13 @@ async with httpx.AsyncClient(
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("addfilter", add_filter_cmd))
+    app.add_handler(CommandHandler("game", game_command_handler))
     app.add_handler(CommandHandler("delfilter", del_filter_cmd))
     app.add_handler(CallbackQueryHandler(menu_handler))
 
-    # Poker handlers (callback-based)
-    app.add_handler(CallbackQueryHandler(poker_callback_handler, pattern=r"^poker_"))
+    # Games & callbacks
+    app.add_handler(CallbackQueryHandler(games_callback_router))
+    # Poker tweets loop will run in background (see background tasks below)
 
     # Scholarship commands
     app.add_handler(CommandHandler("addschsource", add_sch_source_cmd))
@@ -395,6 +397,7 @@ async with httpx.AsyncClient(
     # Background Tasks
     health_checker = asyncio.create_task(nitter_health_loop(http_client))
     scheduler = asyncio.create_task(scheduler_loop(http_client))
+    poker_loop = asyncio.create_task(poker_twitter_loop(http_client))
 
     logger.info(f"Bot {VERSION} initialized. Polling...")
 
