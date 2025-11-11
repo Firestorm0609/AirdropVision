@@ -4,7 +4,7 @@ File name: airdropvision_bot.py
 
 Adds: Poker mini-game (single-player video-poker style) and Scholarship scanner (looks for "fully funded" scholarships on free sources)
 
-No paid APIs required — only uses HTTP scraping with httpx and BeautifulSoup """
+No paid APIs required - only uses HTTP scraping with httpx and BeautifulSoup """
 
 
 import os import json import logging import asyncio import random import urllib.parse from typing import Optional, List, Set, Dict from datetime import datetime from bs4 import BeautifulSoup from flask import Flask import uvicorn import aiosqlite import httpx from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup from telegram.constants import ParseMode from telegram.ext import ( Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, )
