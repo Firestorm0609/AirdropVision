@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-AirdropVision v2.0 — MONOLITHIC AWESOME EDITION (All-in-One File)
-Contains all logic (Config, DB, Scrapers, Games, Main Bot) in a single script.
+AirdropVision v2.1 — MONOLITHIC AWESOME EDITION (All-in-One File)
+FIXED: Game state management for Dice and Race.
+ADDED: User-selectable feature enable/disable settings.
 """
 
 import logging
@@ -42,15 +43,13 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "10"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = "2.0.0-Monolithic-Awesome"
+VERSION = "2.1.0-Monolithic-Awesome"
 DB_PATH = os.environ.get("DB_PATH", "airdropvision_v5.db")
 HTTP_TIMEOUT = 15
 
 # --- Nitter Config ---
 DEFAULT_NITTER_LIST = [
-    "https://nitter.net",
-    "https://nitter.tiekoetter.com",
-    "https://nitter.space"
+    "https://nitter.net", "https://nitter.tiekoetter.com", "https://nitter.space"
 ]
 NITTER_INSTANCES_CSV = os.environ.get("NITTER_INSTANCES_CSV")
 NITTER_INSTANCES = [url.strip() for url in (NITTER_INSTANCES_CSV.split(',') if NITTER_INSTANCES_CSV else DEFAULT_NITTER_LIST) if url.strip()]
@@ -59,10 +58,13 @@ NITTER_SEARCH_QUERIES = [
     '("free mint" OR "free-mint") -filter:replies',
     '("solana airdrop") -filter:replies'
 ]
-POKER_TWEET_QUERIES = [
-    '"poker tournament" -filter:replies',
-    '"freeroll" -filter:replies'
-]
+
+# --- Feature/Job Config ---
+WEB3_JOBS_QUERIES = {
+    "cm": '"community manager" web3 -"looking for"',
+    "mod": '"community moderator" web3 -"looking for"',
+    "shiller": 'shiller web3 -"looking for"',
+}
 
 # --- Scholarship Config ---
 DEFAULT_SCHOLARSHIP_SOURCES = [
@@ -80,6 +82,8 @@ HEALTHY_NITTER_INSTANCES: List[str] = []
 NITTER_CHECK_LOCK = asyncio.Lock()
 FILTER_LOCK = asyncio.Lock()
 SCHOLARSHIP_LOCK = asyncio.Lock()
+# NEW: Feature state storage
+ENABLED_FEATURES: Dict[str, bool] = {}
 
 # ----------------- LOGGING SETUP -----------------
 logging.basicConfig(
@@ -159,13 +163,13 @@ class DB:
             await conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)", (k, v))
             await conn.commit()
 
-    async def meta_get_json(self, k: str, default: list = []) -> list:
+    async def meta_get_json(self, k: str, default: dict = {}) -> dict:
         val = await self.meta_get(k)
         if not val: return default
         try: return json.loads(val)
         except: return default
 
-    async def meta_set_json(self, k: str, v: list):
+    async def meta_set_json(self, k: str, v: dict):
         await self.meta_set(k, json.dumps(v))
 
 # Create a single, shared instance
@@ -215,6 +219,30 @@ def is_spam(text: str) -> bool:
     text_low = text.lower()
     return any(w in text_low for w in SPAM_WORDS)
 
+# ----------------- FEATURE MANAGEMENT -----------------
+async def load_enabled_features():
+    """Loads feature toggles from DB into the global ENABLED_FEATURES dict."""
+    defaults = {
+        "airdrop": True, "scholarship": True,
+        "job_cm": True, "job_mod": True, "job_shiller": True
+    }
+    stored = await db.meta_get_json("enabled_features", defaults)
+    
+    # Ensure all defaults are present in case of new features
+    for k, v in defaults.items():
+        if k not in stored:
+            stored[k] = v
+            
+    global ENABLED_FEATURES
+    ENABLED_FEATURES = stored
+    logger.info(f"Loaded feature states: {ENABLED_FEATURES}")
+    
+async def save_enabled_features():
+    await db.meta_set_json("enabled_features", ENABLED_FEATURES)
+
+def is_feature_enabled(key: str) -> bool:
+    return ENABLED_FEATURES.get(key, False) # Default to False if key somehow missing
+
 # ----------------- NITTER/TWITTER -----------------
 def parse_nitter(html: str, base_url: str):
     soup = BeautifulSoup(html, "lxml")
@@ -254,7 +282,11 @@ async def nitter_health_loop(http_client: httpx.AsyncClient):
         await check_nitter_health(http_client)
         await asyncio.sleep(1800) # 30 mins
 
-async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str):
+async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str, feature_key: str):
+    if not is_feature_enabled(feature_key):
+        logger.debug(f"Skipping {feature_key} scan (disabled).")
+        return
+
     async with NITTER_CHECK_LOCK:
         instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
     if not instances:
@@ -283,8 +315,12 @@ async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], 
                 logger.debug(f"Nitter error {instance}: {e}")
         await asyncio.sleep(2)
 
-# ----------------- NFT CALENDAR -----------------
+# ----------------- NFT CALENDAR (Airdrop/FRee Mint) -----------------
 async def scan_calendar(http_client: httpx.AsyncClient):
+    if not is_feature_enabled("airdrop"):
+        logger.debug("Skipping NFT Calendar scan (Airdrop disabled).")
+        return
+
     try:
         r = await http_client.get(NFTCALENDAR_API, timeout=HTTP_TIMEOUT)
         if r.status_code != 200: return
@@ -303,7 +339,7 @@ async def scan_calendar(http_client: httpx.AsyncClient):
             if await db.seen_add(f"cal:{nid}", "calendar", nft):
                 url = nft.get("url") or nft.get("link") or "N/A"
                 date = nft.get("launch_date")
-                msg = f"🗓 *NFT Calendar (Free)*\n\n*{name}*\nPrice: {price}\nDate: {date}\n\n🔗 [{url}]({url})"
+                msg = f"🗓 *NFT Calendar (Free Mint)*\n\n*{name}*\nPrice: {price}\nDate: {date}\n\n🔗 [{url}]({url})"
                 await send_telegram_async(http_client, msg)
                 await asyncio.sleep(0.5)
     except Exception as e:
@@ -318,6 +354,10 @@ async def get_scholarship_sources() -> List[str]:
     return stored
 
 async def scan_scholarships(http_client: httpx.AsyncClient, limit_per_site=5):
+    if not is_feature_enabled("scholarship"):
+        logger.debug("Skipping Scholarship scan (disabled).")
+        return
+
     sources = await get_scholarship_sources()
     keywords = ["fully funded", "fully-funded", "full scholarship"]
     
@@ -346,14 +386,34 @@ async def scan_scholarships(http_client: httpx.AsyncClient, limit_per_site=5):
         except Exception as e:
             logger.debug(f"Scholarship scan error for {s}: {e}")
 
+# ----------------- WEB3 JOBS -----------------
+async def scan_web3_jobs(http_client: httpx.AsyncClient):
+    job_types = {
+        "job_cm": ("Community Manager", WEB3_JOBS_QUERIES["cm"]),
+        "job_mod": ("Community Moderator", WEB3_JOBS_QUERIES["mod"]),
+        "job_shiller": ("Shiller/Promoter", WEB3_JOBS_QUERIES["shiller"]),
+    }
+    
+    for key, (tag_name, query) in job_types.items():
+        if is_feature_enabled(key):
+            await scan_nitter_query(http_client, [query], f"job_{key}", f"💼 *Web3 Job: {tag_name}*", key)
+        else:
+            logger.debug(f"Skipping Web3 Job: {tag_name} scan (disabled).")
+
 # ----------------- MAIN SCHEDULERS -----------------
 async def scheduler_loop(http_client: httpx.AsyncClient):
     logger.info("Scheduler started.")
     while True:
         try:
+            # Airdrops (Nitter & Calendar)
             await scan_calendar(http_client)
-            await scan_nitter_query(http_client, NITTER_SEARCH_QUERIES, "nitter", "🐦 *Twitter/Nitter*")
+            await scan_nitter_query(http_client, NITTER_SEARCH_QUERIES, "nitter", "🐦 *Twitter/Nitter Airdrop*", "airdrop")
+            
+            # Scholarships
             await scan_scholarships(http_client)
+            
+            # Web3 Jobs
+            await scan_web3_jobs(http_client)
             
             count = await db.seen_count()
             logger.info(f"Scan cycle complete. DB Size: {count}")
@@ -361,22 +421,18 @@ async def scheduler_loop(http_client: httpx.AsyncClient):
             logger.error(f"Scheduler error: {e}")
         await asyncio.sleep(POLL_INTERVAL_MINUTES * 60)
 
-async def poker_twitter_loop(http_client: httpx.AsyncClient):
-    logger.info("Poker scanner started.")
+async def nitter_health_loop(http_client: httpx.AsyncClient):
     while True:
-        try:
-            await scan_nitter_query(http_client, POKER_TWEET_QUERIES, "poker", "🃏 *Poker Tweet*")
-        except Exception as e:
-            logger.debug(f"Poker loop error: {e}")
-        await asyncio.sleep(600) # Scan for poker every 10 mins
+        await check_nitter_health(http_client)
+        await asyncio.sleep(1800) # 30 mins
 
 async def run_manual_scan(http_client: httpx.AsyncClient, chat_id: int, context):
     await context.bot.send_message(chat_id, "🚀 Manual scan initiated...")
     try:
         await scan_calendar(http_client)
-        await scan_nitter_query(http_client, NITTER_SEARCH_QUERIES, "nitter", "🐦 *Twitter/Nitter*")
+        await scan_nitter_query(http_client, NITTER_SEARCH_QUERIES, "nitter", "🐦 *Twitter/Nitter Airdrop*", "airdrop")
         await scan_scholarships(http_client)
-        await scan_nitter_query(http_client, POKER_TWEET_QUERIES, "poker", "🃏 *Poker Tweet*")
+        await scan_web3_jobs(http_client)
         await context.bot.send_message(chat_id, "✅ Manual Scan Complete.")
     except Exception as e:
         logger.error(f"Manual scan error: {e}")
@@ -384,10 +440,11 @@ async def run_manual_scan(http_client: httpx.AsyncClient, chat_id: int, context)
 
 
 # ----------------------------------------------------------------------
-## 4. 🎮 GAMES LOGIC
+## 4. 🎮 GAMES LOGIC (FIXED)
 # ----------------------------------------------------------------------
 
 # ----------------- GAME COMMAND ROUTER -----------------
+# (Game logic unchanged, but integrated into this monolithic file)
 async def game_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Router for all /game <name> commands."""
     if not context.args:
@@ -431,7 +488,8 @@ async def handle_game_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if gid not in context.chat_data:
-        await query.answer("Game expired or not found.", show_alert=True)
+        # FIX: The core issue was here, updating the message when expired.
+        await query.answer("Game expired or not found. Please start a new one.", show_alert=True)
         await query.edit_message_text("This game has expired. Please start a new one.")
         return
         
@@ -473,7 +531,7 @@ async def handle_scramble_reply(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             await update.message.reply_text("Nope, try again!", quote=True)
 
-# ----------------- HORSE RACE -----------------
+# ----------------- HORSE RACE (FIXED START) -----------------
 async def start_horse_race(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = f"race:{int(datetime.now().timestamp())}"
     horses = ["🐎1","🐎2","🐎3","🐎4"]
@@ -487,11 +545,16 @@ async def start_horse_race(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     source_message = update.callback_query.message if update.callback_query else update.message
     
-    msg = await source_message.reply_text(
-        "🐴 *Horse Race!*\nPick a horse. One per player.",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    text = "🐴 *Horse Race!*\nPick a horse. One per player."
+    markup = InlineKeyboardMarkup(kb)
+
+    if update.callback_query:
+        # FIX: Edit the existing menu message if it came from the menu button
+        msg = await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    else:
+        # Command start is fine with reply_text
+        msg = await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        
     context.chat_data[gid]["message_id"] = msg.message_id
 
 async def handle_race_join(query, context, game, gid, data_parts):
@@ -578,11 +641,10 @@ async def run_race_animation(context: ContextTypes.DEFAULT_TYPE, message: Messag
         parse_mode=ParseMode.MARKDOWN
     )
     
-    # Cleanup game state after the race is 100% complete
     if gid in context.chat_data:
         del context.chat_data[gid]
 
-# ----------------- DICE DUEL -----------------
+# ----------------- DICE DUEL (FIXED START) -----------------
 async def start_dice_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = f"dice:{int(datetime.now().timestamp())}"
     context.chat_data[gid] = {
@@ -594,13 +656,16 @@ async def start_dice_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🏁 End Game", callback_data=f"game:dice_end:{gid}")],
     ]
     
-    source_message = update.callback_query.message if update.callback_query else update.message
+    text = "🎲 *Dice Duel!*\nTap to roll. When done, tap End Game."
+    markup = InlineKeyboardMarkup(kb)
 
-    msg = await source_message.reply_text(
-        "🎲 *Dice Duel!*\nTap to roll. When done, tap End Game.",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    if update.callback_query:
+        # FIX: Edit the existing menu message if it came from the menu button
+        msg = await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    else:
+        # Command start is fine with reply_text
+        msg = await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        
     context.chat_data[gid]["message_id"] = msg.message_id
 
 async def handle_dice_roll(query, context, game, gid):
@@ -637,6 +702,7 @@ async def start_word_scramble(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     source_message = update.callback_query.message if update.callback_query else update.message
 
+    # Scramble is fine with reply_text even from callback as it's meant to start a new thread
     msg = await source_message.reply_text(
         f"🧠 *Word Scramble*\n\nUnscramble this word:\n\n`{scrambled.upper()}`\n\nReply to this message with your answer!",
         parse_mode=ParseMode.MARKDOWN
@@ -649,7 +715,7 @@ async def start_word_scramble(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ----------------------------------------------------------------------
-## 5. 🤖 TELEGRAM BOT & MAIN COORDINATOR
+## 5. 🤖 TELEGRAM BOT & MAIN COORDINATOR (UPDATED)
 # ----------------------------------------------------------------------
 
 # ----------------- AUTH HELPER -----------------
@@ -673,7 +739,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context): return
     keyboard = [
         [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("⚙️ Filters", callback_data="filters")],
-        [InlineKeyboardButton("🎓 Scholarships", callback_data="scholarships_menu"), InlineKeyboardButton("🎮 Games", callback_data="games_menu")],
+        [InlineKeyboardButton("✅ Features", callback_data="features_menu"), InlineKeyboardButton("🎮 Games", callback_data="games_menu")],
         [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")],
     ]
     await update.message.reply_text(
@@ -685,10 +751,49 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_main_menu():
     keyboard = [
         [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("⚙️ Filters", callback_data="filters")],
-        [InlineKeyboardButton("🎓 Scholarships", callback_data="scholarships_menu"), InlineKeyboardButton("🎮 Games", callback_data="games_menu")],
+        [InlineKeyboardButton("✅ Features", callback_data="features_menu"), InlineKeyboardButton("🎮 Games", callback_data="games_menu")],
         [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")],
     ]
     return "🤖 *Main Menu*\nActive & Scanning...", InlineKeyboardMarkup(keyboard)
+
+# ----------------- FEATURE TOGGLE HELPERS -----------------
+FEATURE_MAP = {
+    "airdrop": "Airdrops & Free Mints (Twitter/Calendar)",
+    "scholarship": "Scholarships",
+    "job_cm": "Web3 Job: Community Manager",
+    "job_mod": "Web3 Job: Community Moderator",
+    "job_shiller": "Web3 Job: Shiller/Promoter",
+}
+
+async def get_features_menu_markup():
+    await load_enabled_features()
+    kb = []
+    
+    for key, name in FEATURE_MAP.items():
+        status = "✅ Enabled" if is_feature_enabled(key) else "❌ Disabled"
+        kb.append([InlineKeyboardButton(f"{status} | {name}", callback_data=f"toggle_feature:{key}")])
+        
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+    return InlineKeyboardMarkup(kb)
+
+async def features_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    markup = await get_features_menu_markup()
+    text = "✅ *Feature Toggles*\nSelect a feature to enable or disable its scanning and posting."
+    await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+
+async def toggle_feature_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, data_parts: List[str]):
+    key = data_parts[1]
+    
+    if key in ENABLED_FEATURES:
+        ENABLED_FEATURES[key] = not ENABLED_FEATURES[key]
+        await save_enabled_features()
+        status_text = "Enabled" if ENABLED_FEATURES[key] else "Disabled"
+        await update.callback_query.answer(f"{FEATURE_MAP.get(key, key)} set to {status_text}!", show_alert=True)
+    else:
+        await update.callback_query.answer("Unknown feature.", show_alert=True)
+        
+    # Refresh the menu
+    await features_menu_handler(update, context)
 
 # ----------------- FILTER COMMANDS -----------------
 async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -787,6 +892,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         http_client = context.application.bot_data['http_client']
         asyncio.create_task(run_manual_scan(http_client, query.message.chat_id, context))
 
+    # --- Feature Routes ---
+    elif data == "features_menu":
+        await features_menu_handler(update, context)
+        
+    elif data.startswith("toggle_feature:"):
+        await toggle_feature_handler(update, context, data.split(":"))
+
     # --- Filter Routes ---
     elif data == "filters":
         kb = [
@@ -816,6 +928,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Scholarship Routes ---
     elif data == "scholarships_menu":
+        # Note: Scholarship settings is still here for historical reasons, but feature toggle is main
         kb = [
             [InlineKeyboardButton("📜 List Sources", callback_data="list_sch_sources")],
             [InlineKeyboardButton("➕ Add Source (/addschsource)", callback_data="add_sch_info")],
@@ -855,7 +968,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
 
-    # --- Game Routes (Delegated to games.py logic) ---
+    # --- Game Routes ---
     elif data.startswith("game:"):
         await handle_game_callback(update, context, data.split(":"))
 
@@ -893,9 +1006,10 @@ async def main():
         follow_redirects=True,
     ) as http_client:
 
-        # Init DB and spam words
+        # Init DB and load initial state
         await db.init()
         await load_spam_words()
+        await load_enabled_features() # Load feature toggles
 
         # Start the web server
         asgi_server_task = asyncio.create_task(run_asgi_server())
@@ -919,7 +1033,6 @@ async def main():
         # --- Background Tasks ---
         health_checker = asyncio.create_task(nitter_health_loop(http_client))
         scheduler = asyncio.create_task(scheduler_loop(http_client))
-        poker_loop = asyncio.create_task(poker_twitter_loop(http_client))
 
         logger.info(f"Bot {VERSION} initialized. Starting polling...")
         
@@ -927,7 +1040,7 @@ async def main():
         await app.updater.start_polling()
         await app.start()
 
-        all_tasks = [health_checker, scheduler, poker_loop, asgi_server_task]
+        all_tasks = [health_checker, scheduler, asgi_server_task]
         try:
             await asyncio.gather(*all_tasks)
         except (asyncio.CancelledError, KeyboardInterrupt):
@@ -949,4 +1062,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Program exited gracefully.")
-
