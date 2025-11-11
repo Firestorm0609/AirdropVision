@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/-bin/env python3
 """
 AirdropVision — Off-chain bot (NFTCalendar + Nitter) [Async Version]
 
@@ -307,7 +307,7 @@ def parse_nitter_search_html(html: str, base_url: str) -> List[dict]:
                 if parent:
                     content_div = parent.find(
                         "div", class_="tweet-content"
-                    ) or parent.find("div", class="content")
+                    ) or parent.find("div", class_="content")  # <-- ** THE FIX IS HERE **
                     if content_div:
                         text = content_div.get_text(" ", strip=True)
                 results.append({"id": tweet_id, "user": user, "url": tweet_url, "text": text})
