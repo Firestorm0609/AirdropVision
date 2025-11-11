@@ -486,24 +486,66 @@ async def main():
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Start the scheduler as a background task in the asyncio event loop
-    asyncio.create_task(scheduler_loop())
+    # Start the scheduler as a background task
+    # We store the task object so we can cancel it on shutdown
+    scheduler_task = asyncio.create_task(scheduler_loop())
     logger.info("Scheduler task started")
 
-    logger.info("Starting Telegram polling (asyncio main).")
+    # --- REVISED BOT STARTUP ---
+    # This pattern avoids the `run_polling` bug by manually
+    # starting the components and not letting PTB manage the loop.
     try:
-        await application.run_polling()
+        logger.info("Initializing Telegram application...")
+        await application.initialize()
+        
+        logger.info("Starting Telegram polling (background)...")
+        await application.updater.start_polling()
+        
+        logger.info("Starting Telegram application handlers...")
+        await application.start()
+
+        logger.info("Bot is now running. Main coroutine will sleep indefinitely.")
+        # Keep the main coroutine alive so asyncio.run() doesn't exit
+        while True:
+            await asyncio.sleep(3600)
+
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Shutdown signal received.")
     except Exception as e:
-        logger.exception("Application.run_polling error: %s", e)
+        logger.exception("Unhandled error in main async task: %s", e)
     finally:
+        logger.info("Shutting down...")
+        
+        # Stop PTB components
+        if application.updater and application.updater.is_running:
+            await application.updater.stop()
+        if application.running:
+            await application.stop()
+        await application.shutdown()
+
+        # Cancel our scheduler task
+        logger.info("Cancelling scheduler task...")
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            logger.info("Scheduler task cancelled successfully.")
+
+        # Close the global HTTP client
         logger.info("Shutting down http_client...")
         await http_client.aclose()
-        logger.info("Shutdown complete.")
+        logger.info("Async shutdown complete.")
 
 
 if __name__ == "__main__":
+    # asyncio.run() is the modern way. It handles loop creation
+    # and shutdown, including signal handling (like KeyboardInterrupt).
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Shutdown requested by user.")
+        logger.info("Shutdown requested by user (KeyboardInterrupt).")
+    except Exception as e:
+        logger.exception("Critical unhandled error in asyncio.run: %s", e)
+    finally:
+        logger.info("Process exiting.")
 
