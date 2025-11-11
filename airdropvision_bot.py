@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-AirdropVision v1.0 — BETA RELEASE
-REMOVED: All Feature Toggles (including Web3 Jobs and Airdrop toggle).
-SIMPLIFIED: Scheduler now only runs Custom Nitter Queries.
-ADDED: Inline buttons for /addquery, /delquery, /addfilter, /delfilter command entry points.
+AirdropVision v1.1 — ENHANCED NITTER RESILIENCE EDITION
+UPDATED: More reliable Nitter instances and better error handling
+IMPROVED: Rate limit handling and request delays
 """
 
 import logging
@@ -13,6 +12,7 @@ import uvicorn
 import os
 import json
 import urllib.parse
+import random
 from typing import List, Dict, Set, Optional
 
 # External dependencies
@@ -37,16 +37,23 @@ from telegram.ext import (
 # --- Core Bot Config ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "10"))
+POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "15"))  # Increased from 10
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = "1.0.0" # BETA RELEASE
+VERSION = "1.1.0"  # Updated version
 DB_PATH = os.environ.get("DB_PATH", "airdropvision_v5.db")
-HTTP_TIMEOUT = 15
+HTTP_TIMEOUT = 30  # Increased from 15
 
-# --- Nitter Config ---
+# --- Nitter Config - UPDATED INSTANCES ---
 DEFAULT_NITTER_LIST = [
-    "https://nitter.net", "https://nitter.tiekoetter.com", "https://nitter.space"
+    "https://nitter.privacyredirect.com",
+    "https://nitter.poast.org",
+    "https://nitter.fdn.fr", 
+    "https://nitter.1d4.us",
+    "https://nitter.kavin.rocks",
+    "https://nitter.tedomum.net",
+    "https://nitter.slipfox.xyz",
+    "https://nitter.dcs0.hu"
 ]
 NITTER_INSTANCES_CSV = os.environ.get("NITTER_INSTANCES_CSV")
 NITTER_INSTANCES = [url.strip() for url in (NITTER_INSTANCES_CSV.split(',') if NITTER_INSTANCES_CSV else DEFAULT_NITTER_LIST) if url.strip()]
@@ -58,7 +65,7 @@ DEFAULT_CUSTOM_QUERIES = [
 ]
 
 # --- Spam Config ---
-DEFAULT_SPAM_KEYWORDS = "" # UPDATED: Empty string to start with no default filters
+DEFAULT_SPAM_KEYWORDS = ""  # Empty string to start with no default filters
 
 # --- Global State & Locks ---
 SPAM_WORDS: Set[str] = set()
@@ -212,7 +219,7 @@ async def get_custom_nitter_queries() -> List[str]:
         return DEFAULT_CUSTOM_QUERIES
     return stored
 
-# ----------------- NITTER/TWITTER -----------------
+# ----------------- NITTER/TWITTER - ENHANCED -----------------
 def parse_nitter(html: str, base_url: str):
     soup = BeautifulSoup(html, "lxml")
     results = []
@@ -228,62 +235,125 @@ def parse_nitter(html: str, base_url: str):
         results.append({"id": tweet_id, "url": url, "text": text})
     return results
 
-async def check_nitter_health(http_client: httpx.AsyncClient):
+async def check_nitter_health_enhanced(http_client: httpx.AsyncClient):
+    """Enhanced health check with better error handling and user agent rotation"""
     logger.info("Checking Nitter instances health...")
+    
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    ]
+    
     async def check(instance):
         try:
-            r = await http_client.get(f"{instance}/search?q=test", timeout=8)
+            headers = {"User-Agent": random.choice(user_agents)}
+            r = await http_client.get(
+                f"{instance}/search?q=test", 
+                timeout=10,
+                headers=headers
+            )
             if r.status_code == 200 and ("timeline" in r.text or "tweet" in r.text):
+                logger.debug(f"✅ Instance healthy: {instance}")
                 return instance
-        except: pass
-        return None
+            else:
+                logger.warning(f"❌ Instance {instance} returned status {r.status_code}")
+                return None
+        except Exception as e:
+            logger.debug(f"❌ Instance {instance} failed: {e}")
+            return None
 
     tasks = [check(i) for i in NITTER_INSTANCES]
     results = await asyncio.gather(*tasks)
     healthy = [r for r in results if r]
+    
     global HEALTHY_NITTER_INSTANCES
     async with NITTER_CHECK_LOCK:
         HEALTHY_NITTER_INSTANCES = healthy
+        
     logger.info(f"Healthy Nitter instances: {len(healthy)}")
+    if healthy:
+        logger.info(f"Working instances: {healthy}")
+    else:
+        logger.error("No healthy Nitter instances available!")
+    
+    return healthy
 
 async def nitter_health_loop(http_client: httpx.AsyncClient):
     while True:
-        await check_nitter_health(http_client)
-        await asyncio.sleep(1800) # 30 mins
+        await check_nitter_health_enhanced(http_client)
+        await asyncio.sleep(600)  # Check every 10 minutes instead of 30
 
-async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str):
-    # Feature toggle logic removed, always run scan if queries exist
+async def scan_nitter_query_enhanced(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str, max_retries=2):
+    """Enhanced scanner with retry logic and better instance handling"""
     if not queries:
         logger.debug(f"Skipping {tag} scan (no queries provided).")
         return
 
+    # Get healthy instances
     async with NITTER_CHECK_LOCK:
         instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
+        
     if not instances:
         logger.warning(f"No Nitter instances for {tag} scan.")
-        return
+        # Try to refresh health status
+        instances = await check_nitter_health_enhanced(http_client)
+        if not instances:
+            logger.error("Still no healthy instances after refresh. Skipping scan.")
+            return
+
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    ]
 
     for q in queries:
-        for instance in instances:
-            try:
-                url = f"{instance}/search?f=tweets&q={urllib.parse.quote(q)}"
-                r = await http_client.get(url, timeout=HTTP_TIMEOUT)
-                if r.status_code != 200: continue
-                
-                parsed = await asyncio.to_thread(parse_nitter, r.text, instance)
-                if not parsed: continue
-
-                for t in parsed[:MAX_RESULTS]:
-                    if is_spam(t['text']):
-                        continue
-                    if await db.seen_add(f"{db_kind}:{t['id']}", db_kind, t):
-                        msg = f"{tag} (Query: `{q}`)\n\n{t['text']}\n\n🔗 [Link]({t['url']})"
-                        await send_telegram_async(http_client, msg)
-                        await asyncio.sleep(0.5)
-                break 
-            except Exception as e:
-                logger.debug(f"Nitter error {instance}: {e}")
-        await asyncio.sleep(2)
+        success = False
+        for retry in range(max_retries):
+            random.shuffle(instances)  # Try instances in random order
+            for instance in instances:
+                try:
+                    headers = {"User-Agent": random.choice(user_agents)}
+                    url = f"{instance}/search?f=tweets&q={urllib.parse.quote(q)}"
+                    logger.debug(f"Trying {instance} for query: {q}")
+                    
+                    r = await http_client.get(url, timeout=HTTP_TIMEOUT, headers=headers)
+                    
+                    if r.status_code == 200:
+                        parsed = await asyncio.to_thread(parse_nitter, r.text, instance)
+                        if parsed:
+                            logger.info(f"✅ Found {len(parsed)} results from {instance} for: {q}")
+                            
+                            for t in parsed[:MAX_RESULTS]:
+                                if is_spam(t['text']):
+                                    continue
+                                if await db.seen_add(f"{db_kind}:{t['id']}", db_kind, t):
+                                    msg = f"{tag} (Query: `{q}`)\n\n{t['text']}\n\n🔗 [Link]({t['url']})"
+                                    await send_telegram_async(http_client, msg)
+                                    await asyncio.sleep(1)  # Increased delay between tweets
+                            
+                            success = True
+                            break  # Success with this instance, move to next query
+                        else:
+                            logger.debug(f"No results from {instance} for query: {q}")
+                    elif r.status_code == 429:
+                        logger.warning(f"Rate limited by {instance}, will retry other instances")
+                        continue  # Try next instance
+                    else:
+                        logger.warning(f"Instance {instance} returned {r.status_code} for query: {q}")
+                        
+                except Exception as e:
+                    logger.debug(f"Nitter error {instance}: {e}")
+            
+            if success:
+                break  # Success with this query, move to next query
+            else:
+                logger.warning(f"Query '{q}' failed on all instances, retry {retry + 1}/{max_retries}")
+                if retry < max_retries - 1:
+                    await asyncio.sleep(10 * (retry + 1))  # Exponential backoff
+        
+        # Longer delay between queries to avoid rate limiting
+        await asyncio.sleep(8)
 
 # ----------------- MAIN SCHEDULERS -----------------
 async def scheduler_loop(http_client: httpx.AsyncClient):
@@ -291,7 +361,7 @@ async def scheduler_loop(http_client: httpx.AsyncClient):
     while True:
         try:
             custom_queries = await get_custom_nitter_queries()
-            await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
+            await scan_nitter_query_enhanced(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
             
             count = await db.seen_count()
             logger.info(f"Scan cycle complete. DB Size: {count}")
@@ -303,7 +373,7 @@ async def run_manual_scan(http_client: httpx.AsyncClient, chat_id: int, context)
     await context.bot.send_message(chat_id, "🚀 Manual scan initiated...")
     try:
         custom_queries = await get_custom_nitter_queries()
-        await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
+        await scan_nitter_query_enhanced(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
         
         await context.bot.send_message(chat_id, "✅ Manual Scan Complete.")
     except Exception as e:
@@ -355,7 +425,8 @@ async def get_stats_menu():
         f"➡️ **Items Tracked:** `{count}`\n"
         f"➡️ **Custom Queries:** `{queries_count}`\n"
         f"➡️ **Spam Filters:** `{spam_count}`\n"
-        f"➡️ **Healthy Nitter Nodes:** `{healthy_count}`"
+        f"➡️ **Healthy Nitter Nodes:** `{healthy_count}`\n"
+        f"➡️ **Version:** `{VERSION}`"
     )
     keyboard = [[InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]]
     return text, InlineKeyboardMarkup(keyboard)
@@ -518,7 +589,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "list_filters":
         text, markup = await get_list_filters_menu()
 
-    # Command Input Screens (NEW)
+    # Command Input Screens
     elif data == "add_query_input":
         text, markup = await get_command_input_menu("add_query")
     elif data == "del_query_input":
@@ -576,8 +647,11 @@ async def main():
 
         # Init DB and load initial state
         await db.init()
-        await load_spam_words() # Will load from DB or an empty list (since default is empty)
-        await get_custom_nitter_queries() 
+        await load_spam_words()
+        await get_custom_nitter_queries()
+
+        # Initial health check
+        await check_nitter_health_enhanced(http_client)
 
         # Start the web server
         asgi_server_task = asyncio.create_task(run_asgi_server())
@@ -629,4 +703,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Program exited gracefully.")
-
