@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-AirdropVision v2.1 — MONOLITHIC AWESOME EDITION (All-in-One File)
-REMOVED: All Game logic (Dice, Race, Scramble).
-FIXED: Game state management for Dice and Race. (FIXES REMOVED as code is gone)
-ADDED: User-selectable feature enable/disable settings.
+AirdropVision v2.2 — BEAUTIFUL UI EDITION
+REMOVED: All Scholarship logic.
+REMOVED: All Game logic.
+ADDED: Comprehensive, nested inline menu system for beautiful UI.
 """
 
 import logging
@@ -13,8 +13,6 @@ import uvicorn
 import os
 import json
 import urllib.parse
-import random
-from datetime import datetime
 from typing import List, Dict, Set, Optional
 
 # External dependencies
@@ -22,7 +20,7 @@ import aiosqlite
 from bs4 import BeautifulSoup
 from flask import Flask
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -30,7 +28,6 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    filters,
 )
 
 # ----------------------------------------------------------------------
@@ -43,7 +40,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "10"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = "2.1.0-Monolithic-Awesome"
+VERSION = "2.2.0-Beautiful-UI"
 DB_PATH = os.environ.get("DB_PATH", "airdropvision_v5.db")
 HTTP_TIMEOUT = 15
 
@@ -54,7 +51,8 @@ DEFAULT_NITTER_LIST = [
 NITTER_INSTANCES_CSV = os.environ.get("NITTER_INSTANCES_CSV")
 NITTER_INSTANCES = [url.strip() for url in (NITTER_INSTANCES_CSV.split(',') if NITTER_INSTANCES_CSV else DEFAULT_NITTER_LIST) if url.strip()]
 
-NITTER_SEARCH_QUERIES = [
+# Custom Queries Defaults
+DEFAULT_CUSTOM_QUERIES = [
     '("free mint" OR "free-mint") -filter:replies',
     '("solana airdrop") -filter:replies'
 ]
@@ -66,13 +64,6 @@ WEB3_JOBS_QUERIES = {
     "shiller": 'shiller web3 -"looking for"',
 }
 
-# --- Scholarship Config ---
-DEFAULT_SCHOLARSHIP_SOURCES = [
-    "https://www.scholarship-positions.com/",
-    "https://www.scholarshipsads.com/"
-]
-NFTCALENDAR_API = "https://api.nftcalendar.io/upcoming"
-
 # --- Spam Config ---
 DEFAULT_SPAM_KEYWORDS = "giveaway,retweet,follow,tag 3,like,rt,gleam.io,promo,dm me,whatsapp"
 
@@ -81,8 +72,7 @@ SPAM_WORDS: Set[str] = set()
 HEALTHY_NITTER_INSTANCES: List[str] = []
 NITTER_CHECK_LOCK = asyncio.Lock()
 FILTER_LOCK = asyncio.Lock()
-SCHOLARSHIP_LOCK = asyncio.Lock()
-# NEW: Feature state storage
+QUERY_LOCK = asyncio.Lock()
 ENABLED_FEATURES: Dict[str, bool] = {}
 
 # ----------------- LOGGING SETUP -----------------
@@ -203,7 +193,7 @@ async def send_telegram_async(http_client: httpx.AsyncClient, text: str, parse_m
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
 
-# ----------------- SPAM FILTER -----------------
+# ----------------- STATE MANAGEMENT -----------------
 async def load_spam_words():
     """Loads spam words from DB into the global SPAM_WORDS set."""
     stored = await db.meta_get_json("spam_keywords", [])
@@ -219,19 +209,15 @@ def is_spam(text: str) -> bool:
     text_low = text.lower()
     return any(w in text_low for w in SPAM_WORDS)
 
-# ----------------- FEATURE MANAGEMENT -----------------
 async def load_enabled_features():
     """Loads feature toggles from DB into the global ENABLED_FEATURES dict."""
     defaults = {
-        "airdrop": True, "scholarship": True,
+        "airdrop": True, 
         "job_cm": True, "job_mod": True, "job_shiller": True
     }
     stored = await db.meta_get_json("enabled_features", defaults)
-    
-    # Ensure all defaults are present in case of new features
     for k, v in defaults.items():
-        if k not in stored:
-            stored[k] = v
+        if k not in stored: stored[k] = v
             
     global ENABLED_FEATURES
     ENABLED_FEATURES = stored
@@ -241,10 +227,19 @@ async def save_enabled_features():
     await db.meta_set_json("enabled_features", ENABLED_FEATURES)
 
 def is_feature_enabled(key: str) -> bool:
-    return ENABLED_FEATURES.get(key, False) # Default to False if key somehow missing
+    return ENABLED_FEATURES.get(key, False)
+
+async def get_custom_nitter_queries() -> List[str]:
+    """Retrieves custom queries from DB, setting defaults if none exist."""
+    stored = await db.meta_get_json("custom_nitter_queries", [])
+    if not stored:
+        await db.meta_set_json("custom_nitter_queries", DEFAULT_CUSTOM_QUERIES)
+        return DEFAULT_CUSTOM_QUERIES
+    return stored
 
 # ----------------- NITTER/TWITTER -----------------
 def parse_nitter(html: str, base_url: str):
+    # (Same parsing logic as before)
     soup = BeautifulSoup(html, "lxml")
     results = []
     items = soup.find_all("div", class_="timeline-item")
@@ -260,6 +255,7 @@ def parse_nitter(html: str, base_url: str):
     return results
 
 async def check_nitter_health(http_client: httpx.AsyncClient):
+    # (Same health check logic as before)
     logger.info("Checking Nitter instances health...")
     async def check(instance):
         try:
@@ -307,84 +303,13 @@ async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], 
                     if is_spam(t['text']):
                         continue
                     if await db.seen_add(f"{db_kind}:{t['id']}", db_kind, t):
-                        msg = f"{tag}\n\n{t['text']}\n\n🔗 [Link]({t['url']})"
+                        msg = f"{tag} (Query: `{q}`)\n\n{t['text']}\n\n🔗 [Link]({t['url']})"
                         await send_telegram_async(http_client, msg)
                         await asyncio.sleep(0.5)
                 break 
             except Exception as e:
                 logger.debug(f"Nitter error {instance}: {e}")
         await asyncio.sleep(2)
-
-# ----------------- NFT CALENDAR (Airdrop/FRee Mint) -----------------
-async def scan_calendar(http_client: httpx.AsyncClient):
-    if not is_feature_enabled("airdrop"):
-        logger.debug("Skipping NFT Calendar scan (Airdrop disabled).")
-        return
-
-    try:
-        r = await http_client.get(NFTCALENDAR_API, timeout=HTTP_TIMEOUT)
-        if r.status_code != 200: return
-        data = r.json()
-        items = data if isinstance(data, list) else (data.get("nfts") or data.get("data") or [])
-        for nft in items[:MAX_RESULTS]:
-            if not isinstance(nft, dict): continue
-            nid = str(nft.get("id") or nft.get("slug") or nft.get("name"))
-            name = nft.get("name", "Unknown")
-            desc = nft.get("description", "")
-            if is_spam(name + " " + desc): continue
-            price = str(nft.get("mint_price", "")).lower()
-            is_free = "free" in price or "0" == price.strip() or nft.get("is_free")
-            if not is_free: continue
-            
-            if await db.seen_add(f"cal:{nid}", "calendar", nft):
-                url = nft.get("url") or nft.get("link") or "N/A"
-                date = nft.get("launch_date")
-                msg = f"🗓 *NFT Calendar (Free Mint)*\n\n*{name}*\nPrice: {price}\nDate: {date}\n\n🔗 [{url}]({url})"
-                await send_telegram_async(http_client, msg)
-                await asyncio.sleep(0.5)
-    except Exception as e:
-        logger.error(f"Calendar scan error: {e}")
-
-# ----------------- SCHOLARSHIPS -----------------
-async def get_scholarship_sources() -> List[str]:
-    stored = await db.meta_get_json("scholarship_sources", [])
-    if not stored:
-        await db.meta_set_json("scholarship_sources", DEFAULT_SCHOLARSHIP_SOURCES)
-        return DEFAULT_SCHOLARSHIP_SOURCES
-    return stored
-
-async def scan_scholarships(http_client: httpx.AsyncClient, limit_per_site=5):
-    if not is_feature_enabled("scholarship"):
-        logger.debug("Skipping Scholarship scan (disabled).")
-        return
-
-    sources = await get_scholarship_sources()
-    keywords = ["fully funded", "fully-funded", "full scholarship"]
-    
-    for s in sources:
-        try:
-            r = await http_client.get(s, timeout=HTTP_TIMEOUT)
-            if r.status_code != 200: continue
-            
-            soup = await asyncio.to_thread(BeautifulSoup, r.text, "lxml")
-            links = soup.find_all('a')
-            found = 0
-            
-            for a in links:
-                if found >= limit_per_site: break
-                text = (a.get_text(" ", strip=True) or "").lower()
-                href = a.get('href') or ''
-                
-                if any(k in text for k in keywords):
-                    url = urllib.parse.urljoin(s, href)
-                    uniq_id = f"sch:{url}"
-                    if await db.seen_add(uniq_id, "scholarship", {"title": text, "url": url}):
-                        msg = f"🎓 *Scholarship Scan*\n\n*{a.get_text(' ', strip=True)}*\n\n🔗 [{url}]({url})\nSource: {s}"
-                        await send_telegram_async(http_client, msg)
-                        found += 1
-                        await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.debug(f"Scholarship scan error for {s}: {e}")
 
 # ----------------- WEB3 JOBS -----------------
 async def scan_web3_jobs(http_client: httpx.AsyncClient):
@@ -405,14 +330,9 @@ async def scheduler_loop(http_client: httpx.AsyncClient):
     logger.info("Scheduler started.")
     while True:
         try:
-            # Airdrops (Nitter & Calendar)
-            await scan_calendar(http_client)
-            await scan_nitter_query(http_client, NITTER_SEARCH_QUERIES, "nitter", "🐦 *Twitter/Nitter Airdrop*", "airdrop")
+            custom_queries = await get_custom_nitter_queries()
+            await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*", "airdrop")
             
-            # Scholarships
-            await scan_scholarships(http_client)
-            
-            # Web3 Jobs
             await scan_web3_jobs(http_client)
             
             count = await db.seen_count()
@@ -421,17 +341,11 @@ async def scheduler_loop(http_client: httpx.AsyncClient):
             logger.error(f"Scheduler error: {e}")
         await asyncio.sleep(POLL_INTERVAL_MINUTES * 60)
 
-async def nitter_health_loop(http_client: httpx.AsyncClient):
-    while True:
-        await check_nitter_health(http_client)
-        await asyncio.sleep(1800) # 30 mins
-
 async def run_manual_scan(http_client: httpx.AsyncClient, chat_id: int, context):
     await context.bot.send_message(chat_id, "🚀 Manual scan initiated...")
     try:
-        await scan_calendar(http_client)
-        await scan_nitter_query(http_client, NITTER_SEARCH_QUERIES, "nitter", "🐦 *Twitter/Nitter Airdrop*", "airdrop")
-        await scan_scholarships(http_client)
+        custom_queries = await get_custom_nitter_queries()
+        await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*", "airdrop")
         await scan_web3_jobs(http_client)
         await context.bot.send_message(chat_id, "✅ Manual Scan Complete.")
     except Exception as e:
@@ -440,7 +354,7 @@ async def run_manual_scan(http_client: httpx.AsyncClient, chat_id: int, context)
 
 
 # ----------------------------------------------------------------------
-## 4. 🤖 TELEGRAM BOT & MAIN COORDINATOR (UPDATED)
+## 4. 🤖 TELEGRAM BOT & UI LOGIC
 # ----------------------------------------------------------------------
 
 # ----------------- AUTH HELPER -----------------
@@ -459,68 +373,109 @@ async def auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
         return False
     return True
 
-# ----------------- MAIN MENU & COMMANDS -----------------
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update, context): return
-    keyboard = [
-        [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("⚙️ Filters", callback_data="filters")],
-        [InlineKeyboardButton("✅ Features", callback_data="features_menu")],
-        [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")],
-    ]
-    await update.message.reply_text(
-        f"🤖 *{BOT_NAME} v{VERSION}*\nActive & Scanning...",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
+# ----------------- UI/MENU GENERATORS -----------------
 
 async def get_main_menu():
+    text = f"✨ *{BOT_NAME} v{VERSION} | Main Menu*\n\nChoose an option to manage the bot's operation:"
     keyboard = [
-        [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("⚙️ Filters", callback_data="filters")],
-        [InlineKeyboardButton("✅ Features", callback_data="features_menu")],
-        [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")],
+        [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
+        [InlineKeyboardButton("🐦 Custom Queries", callback_data="queries_menu"), InlineKeyboardButton("🚫 Spam Filters", callback_data="filters_menu")],
+        [InlineKeyboardButton("⚙️ Feature Toggles", callback_data="features_menu")],
+        [InlineKeyboardButton("🚀 Force Scan Now", callback_data="scan_now")],
     ]
-    return "🤖 *Main Menu*\nActive & Scanning...", InlineKeyboardMarkup(keyboard)
+    return text, InlineKeyboardMarkup(keyboard)
 
-# ----------------- FEATURE TOGGLE HELPERS -----------------
+async def get_stats_menu():
+    count = await db.seen_count()
+    spam_count = len(SPAM_WORDS)
+    queries_count = len(await get_custom_nitter_queries())
+    async with NITTER_CHECK_LOCK:
+        healthy_count = len(HEALTHY_NITTER_INSTANCES)
+    
+    text = (
+        "📊 *Bot Statistics*\n\n"
+        f"➡️ **Items Tracked:** `{count}`\n"
+        f"➡️ **Custom Queries:** `{queries_count}`\n"
+        f"➡️ **Spam Filters:** `{spam_count}`\n"
+        f"➡️ **Healthy Nitter Nodes:** `{healthy_count}`"
+    )
+    keyboard = [[InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]]
+    return text, InlineKeyboardMarkup(keyboard)
+
 FEATURE_MAP = {
-    "airdrop": "Airdrops & Free Mints (Twitter/Calendar)",
-    "scholarship": "Scholarships",
+    "airdrop": "Airdrops (Custom Nitter Queries)",
     "job_cm": "Web3 Job: Community Manager",
     "job_mod": "Web3 Job: Community Moderator",
     "job_shiller": "Web3 Job: Shiller/Promoter",
 }
 
-async def get_features_menu_markup():
+async def get_features_menu():
     await load_enabled_features()
     kb = []
     
+    text = "⚙️ *Feature Toggles*\n\nSelect a scanner to enable or disable its operation."
+    
     for key, name in FEATURE_MAP.items():
-        status = "✅ Enabled" if is_feature_enabled(key) else "❌ Disabled"
+        status = "✅ On" if is_feature_enabled(key) else "❌ Off"
         kb.append([InlineKeyboardButton(f"{status} | {name}", callback_data=f"toggle_feature:{key}")])
         
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-    return InlineKeyboardMarkup(kb)
+    kb.append([InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")])
+    return text, InlineKeyboardMarkup(kb)
 
-async def features_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    markup = await get_features_menu_markup()
-    text = "✅ *Feature Toggles*\nSelect a feature to enable or disable its scanning and posting."
-    await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+async def get_queries_menu():
+    text = (
+        "🐦 *Custom Nitter Queries*\n\n"
+        "Manage the search queries used for the main Airdrop/Mint scan.\n\n"
+        "`/addquery <query>` - Add new query\n"
+        "`/delquery <query>` - Remove a query"
+    )
+    kb = [
+        [InlineKeyboardButton("📜 View All Queries", callback_data="list_queries")],
+        [InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]
+    ]
+    return text, InlineKeyboardMarkup(kb)
 
-async def toggle_feature_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, data_parts: List[str]):
-    key = data_parts[1]
+async def get_list_queries_menu():
+    queries = await get_custom_nitter_queries()
+    text = "📜 *Active Nitter Search Queries:*\n\n" + "\n".join([f"• `{q}`" for q in queries])
+    if not queries: text = "No custom queries set. Use `/addquery` to add your first one."
     
-    if key in ENABLED_FEATURES:
-        ENABLED_FEATURES[key] = not ENABLED_FEATURES[key]
-        await save_enabled_features()
-        status_text = "Enabled" if ENABLED_FEATURES[key] else "Disabled"
-        await update.callback_query.answer(f"{FEATURE_MAP.get(key, key)} set to {status_text}!", show_alert=True)
-    else:
-        await update.callback_query.answer("Unknown feature.", show_alert=True)
-        
-    # Refresh the menu
-    await features_menu_handler(update, context)
+    kb = [[InlineKeyboardButton("🔙 Back to Queries Menu", callback_data="queries_menu")]]
+    return text, InlineKeyboardMarkup(kb)
 
-# ----------------- FILTER COMMANDS -----------------
+async def get_filters_menu():
+    text = (
+        "🚫 *Spam Filters*\n\n"
+        "Keywords added here will block a tweet from being posted.\n\n"
+        "`/addfilter <word>` - Add a filter\n"
+        "`/delfilter <word>` - Remove a filter"
+    )
+    kb = [
+        [InlineKeyboardButton("📜 View All Filters", callback_data="list_filters")],
+        [InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]
+    ]
+    return text, InlineKeyboardMarkup(kb)
+
+async def get_list_filters_menu():
+    await load_spam_words()
+    text = "📜 *Active Spam Keywords:*\n\n" + "\n".join([f"• `{w}`" for w in sorted(list(SPAM_WORDS))])
+    if not SPAM_WORDS: text = "No filters set. Use `/addfilter` to add your first one."
+    
+    kb = [[InlineKeyboardButton("🔙 Back to Filters Menu", callback_data="filters_menu")]]
+    return text, InlineKeyboardMarkup(kb)
+
+# ----------------- COMMAND HANDLERS -----------------
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_guard(update, context): return
+    text, markup = await get_main_menu()
+    await update.message.reply_text(
+        text,
+        reply_markup=markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# Configuration commands are kept for ease of use, but logic is simplified
 async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context): return
     if not context.args:
@@ -528,15 +483,13 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     word = " ".join(context.args).lower().strip()
-    
     async with FILTER_LOCK:
-        await load_spam_words()
         current = list(SPAM_WORDS)
         if word not in current:
             current.append(word)
             await db.meta_set_json("spam_keywords", current)
-            await load_spam_words()
-            await update.message.reply_text(f"✅ Added filter: `{word}`", parse_mode=ParseMode.MARKDOWN)
+            await load_spam_words() # Reload global state
+            await update.message.reply_text(f"✅ Added filter: `{word}`. Current count: {len(SPAM_WORDS)}", parse_mode=ParseMode.MARKDOWN)
         else:
             await update.message.reply_text(f"⚠️ Filter `{word}` already exists.", parse_mode=ParseMode.MARKDOWN)
 
@@ -547,48 +500,47 @@ async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     word = " ".join(context.args).lower().strip()
-    
     async with FILTER_LOCK:
-        await load_spam_words()
         current = list(SPAM_WORDS)
         if word in current:
             current.remove(word)
             await db.meta_set_json("spam_keywords", current)
-            await load_spam_words()
-            await update.message.reply_text(f"🗑 Removed filter: `{word}`", parse_mode=ParseMode.MARKDOWN)
+            await load_spam_words() # Reload global state
+            await update.message.reply_text(f"🗑 Removed filter: `{word}`. Current count: {len(SPAM_WORDS)}", parse_mode=ParseMode.MARKDOWN)
         else:
             await update.message.reply_text(f"⚠️ Filter `{word}` not found.", parse_mode=ParseMode.MARKDOWN)
 
-# ----------------- SCHOLARSHIP COMMANDS -----------------
-async def add_sch_source_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_query_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context): return
     if not context.args:
-        await update.message.reply_text("Usage: `/addschsource <url>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage: `/addquery <full_twitter_search_query>`", parse_mode=ParseMode.MARKDOWN)
         return
     
-    url = context.args[0].strip()
-    
-    async with SCHOLARSHIP_LOCK:
-        sources = await get_scholarship_sources()
-        if url not in sources:
-            sources.append(url)
-            await db.meta_set_json("scholarship_sources", sources)
-            await update.message.reply_text(f"✅ Added source: {url}")
+    query = " ".join(context.args).strip()
+    async with QUERY_LOCK:
+        current = await db.meta_get_json("custom_nitter_queries", [])
+        if query not in current:
+            current.append(query)
+            await db.meta_set_json("custom_nitter_queries", current)
+            await update.message.reply_text(f"✅ Added query: `{query}`. Queries: {len(current)}", parse_mode=ParseMode.MARKDOWN)
         else:
-            await update.message.reply_text(f"⚠️ Source already exists.")
+            await update.message.reply_text(f"⚠️ Query `{query}` already exists.", parse_mode=ParseMode.MARKDOWN)
 
-async def list_sch_sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def del_query_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context): return
-    sources = await get_scholarship_sources()
-    text = "🎓 *Scholarship Sources:*\n\n" + "\n".join([f"- `{s}`" for s in sources])
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-async def force_scholarships_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update, context): return
-    http_client = context.application.bot_data['http_client']
-    await update.message.reply_text("🔎 Scanning scholarship sources now...")
-    await scan_scholarships(http_client)
-    await update.message.reply_text("✅ Scholarship scan complete.")
+    if not context.args:
+        await update.message.reply_text("Usage: `/delquery <full_twitter_search_query>`", parse_mode=ParseMode.MARKDOWN)
+        return
+        
+    query = " ".join(context.args).strip()
+    async with QUERY_LOCK:
+        current = await db.meta_get_json("custom_nitter_queries", [])
+        if query in current:
+            current.remove(query)
+            await db.meta_set_json("custom_nitter_queries", current)
+            await update.message.reply_text(f"🗑 Removed query: `{query}`. Queries: {len(current)}", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(f"⚠️ Query `{query}` not found.", parse_mode=ParseMode.MARKDOWN)
 
 # ----------------- CALLBACK ROUTER -----------------
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -599,87 +551,50 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data = query.data
     
+    # Menu Navigation
     if data == "main_menu":
         text, markup = await get_main_menu()
-        await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-    
     elif data == "stats":
-        count = await db.seen_count()
-        spam_count = len(SPAM_WORDS)
-        async with NITTER_CHECK_LOCK:
-            healthy_count = len(HEALTHY_NITTER_INSTANCES)
-        msg = f"📊 *Statistics*\n\nItems Tracked: `{count}`\nSpam Filters: `{spam_count}`\nNitter Nodes: `{healthy_count}`"
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        text, markup = await get_stats_menu()
+    elif data == "features_menu":
+        text, markup = await get_features_menu()
+    elif data == "queries_menu":
+        text, markup = await get_queries_menu()
+    elif data == "list_queries":
+        text, markup = await get_list_queries_menu()
+    elif data == "filters_menu":
+        text, markup = await get_filters_menu()
+    elif data == "list_filters":
+        text, markup = await get_list_filters_menu()
         
+    # Actions
     elif data == "scan_now":
         await query.edit_message_text("🚀 Scanning now... this may take a moment.")
         http_client = context.application.bot_data['http_client']
+        # Start scan in background to avoid callback timeout
         asyncio.create_task(run_manual_scan(http_client, query.message.chat_id, context))
-
-    # --- Feature Routes ---
-    elif data == "features_menu":
-        await features_menu_handler(update, context)
+        return # Do not edit message text after starting background task
         
     elif data.startswith("toggle_feature:"):
-        await toggle_feature_handler(update, context, data.split(":"))
-
-    # --- Filter Routes ---
-    elif data == "filters":
-        kb = [
-            [InlineKeyboardButton("📜 List Filters", callback_data="list_filters")],
-            [InlineKeyboardButton("➕ Add (/addfilter)", callback_data="add_filter_info")],
-            [InlineKeyboardButton("➖ Del (/delfilter)", callback_data="del_filter_info")],
-            [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
-        ]
-        await query.edit_message_text("⚙️ *Filter Settings*\nManage anti-spam keywords.", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-    
-    elif data == "list_filters":
-        await load_spam_words()
-        text = "🚫 *Blocked Keywords:*\n\n" + "\n".join([f"- `{w}`" for w in sorted(list(SPAM_WORDS))])
-        if not SPAM_WORDS: text = "No filters set."
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data="filters")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-    
-    elif data == "add_filter_info":
-        text = "To *ADD* a filter, type:\n`/addfilter <word>`"
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data="filters")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-
-    elif data == "del_filter_info":
-        text = "To *REMOVE* a filter, type:\n`/delfilter <word>`"
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data="filters")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-
-    # --- Scholarship Routes (Optional Menu, mainly uses commands) ---
-    elif data == "scholarships_menu":
-        kb = [
-            [InlineKeyboardButton("📜 List Sources", callback_data="list_sch_sources")],
-            [InlineKeyboardButton("➕ Add Source (/addschsource)", callback_data="add_sch_info")],
-            [InlineKeyboardButton("🔎 Force Scan", callback_data="scan_sch_now")],
-            [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
-        ]
-        await query.edit_message_text("🎓 *Scholarship Settings*\nManage free scholarship sources.", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-
-    elif data == "list_sch_sources":
-        sources = await get_scholarship_sources()
-        text = "🎓 *Scholarship Sources:*\n\n" + "\n".join([f"- `{s}`" for s in sources])
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data="scholarships_menu")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-        
-    elif data == "add_sch_info":
-        text = "To *ADD* a source, type:\n`/addschsource <url>`"
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data="scholarships_menu")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-
-    elif data == "scan_sch_now":
-        await query.edit_message_text("🔎 Scanning scholarship sources now...")
-        http_client = context.application.bot_data['http_client']
-        await scan_scholarships(http_client)
-        await query.message.reply_text("✅ Scholarship scan complete.")
+        key = data.split(":")[1]
+        if key in ENABLED_FEATURES:
+            ENABLED_FEATURES[key] = not ENABLED_FEATURES[key]
+            await save_enabled_features()
+            status_text = "Enabled" if ENABLED_FEATURES[key] else "Disabled"
+            await query.answer(f"{FEATURE_MAP.get(key, key)} set to {status_text}!", show_alert=True)
+        else:
+            await query.answer("Unknown feature.", show_alert=True)
+            
+        # Refresh the features menu
+        text, markup = await get_features_menu()
         
     else:
         logger.warning(f"Unknown callback data: {data}")
+        await query.answer("Unknown action.", show_alert=True)
+        return
+
+    # Update the message with the new menu/screen
+    await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
 # ----------------- FLASK & UVICORN -----------------
 flask_app = Flask(__name__)
@@ -715,7 +630,8 @@ async def main():
         # Init DB and load initial state
         await db.init()
         await load_spam_words()
-        await load_enabled_features() # Load feature toggles
+        await load_enabled_features()
+        await get_custom_nitter_queries() 
 
         # Start the web server
         asgi_server_task = asyncio.create_task(run_asgi_server())
@@ -726,15 +642,13 @@ async def main():
 
         # --- Register Handlers ---
         app.add_handler(CommandHandler("start", start_cmd))
+        
+        # Preserve commands for quick config, although menu is primary UI
         app.add_handler(CommandHandler("addfilter", add_filter_cmd))
         app.add_handler(CommandHandler("delfilter", del_filter_cmd))
-        app.add_handler(CommandHandler("addschsource", add_sch_source_cmd))
-        app.add_handler(CommandHandler("listschsources", list_sch_sources_cmd))
-        app.add_handler(CommandHandler("scholarships", force_scholarships_cmd))
+        app.add_handler(CommandHandler("addquery", add_query_cmd))
+        app.add_handler(CommandHandler("delquery", del_query_cmd))
         
-        # NOTE: Removed CommandHandler("game", game_command_handler)
-        # NOTE: Removed MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_scramble_reply)
-
         app.add_handler(CallbackQueryHandler(callback_router))
 
         # --- Background Tasks ---
