@@ -43,11 +43,38 @@ DB_PATH = os.environ.get("DB_PATH", "airdropvision_offchain.db")
 
 NFTCALENDAR_API = os.environ.get("NFTCALENDAR_API", "https://api.nftcalendar.io/upcoming")
 
-NITTER_INSTANCES = [
-    os.environ.get("NITTER_PRIMARY", "https://nitter.net"),
-    os.environ.get("NITTER_FALLBACK1", "https://nitter.snopyta.org"),
-    os.environ.get("NITTER_FALLBACK2", "https://nitter.1d4.us"),
+# ----------------- LOGGING -----------------
+# Moved up to be available for config logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(BOT_NAME)
+
+# --- Nitter Config (Flexible Version) ---
+# Define a default list to use if the environment variable isn't set
+DEFAULT_NITTER_LIST = [
+    "https://nitter.net",
+    "https://nitter.snopyta.org",
+    "https://nitter.1d4.us",
+    "https://nitter.poast.org",
+    "https://nitter.tiekoetter.com",
+    "https://nitter.space",
+    "https://lightbrd.com",
+    "https://xcancel.com",
+    "https://nuku.trabun.org",
+    "https://nitter.privacyredirect.com",
 ]
+
+# Get the list from a single environment variable, which should be a comma-separated string
+NITTER_INSTANCES_CSV = os.environ.get("NITTER_INSTANCES_CSV")
+
+if NITTER_INSTANCES_CSV:
+    # If the variable exists, split it by the comma and strip any whitespace
+    NITTER_INSTANCES = [url.strip() for url in NITTER_INSTANCES_CSV.split(',') if url.strip()]
+    logger.info(f"Loaded {len(NITTER_INSTANCES)} Nitter instances from NITTER_INSTANCES_CSV.")
+else:
+    # If the variable is not set, use the hardcoded default
+    NITTER_INSTANCES = DEFAULT_NITTER_LIST
+    logger.info(f"NITTER_INSTANCES_CSV not set, using {len(NITTER_INSTANCES)} default instances.")
+
 
 NITTER_SEARCH_QUERIES = [
     '("free mint" OR "free-mint" OR "free mint nft") lang:en',
@@ -59,10 +86,6 @@ NITTER_SEARCH_QUERIES = [
 TELEGRAM_SEND_DELAY_SEC = float(os.environ.get("TELEGRAM_SEND_DELAY_SEC", "0.8"))
 TELEGRAM_RETRY_MAX = 5  # Max retries for failed sends
 HTTP_TIMEOUT = 12  # Timeout for all HTTP requests
-
-# ----------------- LOGGING -----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(BOT_NAME)
 
 # ----------------- DB -----------------
 # NOTE: This DB class remains synchronous and thread-safe.
@@ -284,7 +307,7 @@ def parse_nitter_search_html(html: str, base_url: str) -> List[dict]:
                 if parent:
                     content_div = parent.find(
                         "div", class_="tweet-content"
-                    ) or parent.find("div", class_="content")
+                    ) or parent.find("div", class="content")
                     if content_div:
                         text = content_div.get_text(" ", strip=True)
                 results.append({"id": tweet_id, "user": user, "url": tweet_url, "text": text})
