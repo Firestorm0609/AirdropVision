@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AirdropVision v2.3 — FULL INLINE COMMANDS EDITION
+AirdropVision v1.0 — BETA RELEASE
 REMOVED: All Feature Toggles (including Web3 Jobs and Airdrop toggle).
 SIMPLIFIED: Scheduler now only runs Custom Nitter Queries.
 ADDED: Inline buttons for /addquery, /delquery, /addfilter, /delfilter command entry points.
@@ -40,7 +40,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "10"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = "2.3.0-Full-Inline"
+VERSION = "1.0.0" # BETA RELEASE
 DB_PATH = os.environ.get("DB_PATH", "airdropvision_v5.db")
 HTTP_TIMEOUT = 15
 
@@ -58,7 +58,7 @@ DEFAULT_CUSTOM_QUERIES = [
 ]
 
 # --- Spam Config ---
-DEFAULT_SPAM_KEYWORDS = "giveaway,retweet,follow,tag 3,like,rt,gleam.io,promo,dm me,whatsapp"
+DEFAULT_SPAM_KEYWORDS = "" # UPDATED: Empty string to start with no default filters
 
 # --- Global State & Locks ---
 SPAM_WORDS: Set[str] = set()
@@ -190,8 +190,11 @@ async def load_spam_words():
     """Loads spam words from DB into the global SPAM_WORDS set."""
     stored = await db.meta_get_json("spam_keywords", [])
     if not stored:
+        # Load from DEFAULT_SPAM_KEYWORDS only if DB is empty
         stored = [s.strip().lower() for s in DEFAULT_SPAM_KEYWORDS.split(',') if s.strip()]
-        await db.meta_set_json("spam_keywords", stored)
+        if stored:
+             await db.meta_set_json("spam_keywords", stored)
+             
     global SPAM_WORDS
     SPAM_WORDS = set(stored)
     logger.info(f"Loaded {len(SPAM_WORDS)} spam filters.")
@@ -573,7 +576,7 @@ async def main():
 
         # Init DB and load initial state
         await db.init()
-        await load_spam_words()
+        await load_spam_words() # Will load from DB or an empty list (since default is empty)
         await get_custom_nitter_queries() 
 
         # Start the web server
