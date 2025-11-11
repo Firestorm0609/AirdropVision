@@ -1,29 +1,24 @@
 #!/usr/bin/env python3
 """
 AirdropVision v1.0 — Fully Asynchronous & Secured Off-chain Bot
-Features:
-- Full Async Architecture: HTTPX context management and Uvicorn server integration.
-- Security: Mandatory Chat ID authorization for all bot commands.
-- Database: Column access by name (aiosqlite.Row) for readability.
-- Sources: NFTCalendar, Nitter (Twitter)
-- Anti-Spam: Keyword filtering (configurable via Telegram)
-- Resilience: Dynamic Nitter instance health checking
-- Database: Fully Async SQLite (aiosqlite)
-- Interface: Inline buttons for controls
+- File name: airdropvision_bot.py
+- Adds: Poker mini-game (single-player video-poker style) and Scholarship scanner (looks for "fully funded" scholarships on free sources)
+- No paid APIs required — only uses HTTP scraping with httpx and BeautifulSoup
 """
 
 import os
 import json
 import logging
 import asyncio
+import random
 import urllib.parse
-from typing import Optional, List, Set
+from typing import Optional, List, Set, Dict
 from datetime import datetime
 from bs4 import BeautifulSoup
-from flask import Flask # Still needed for the main app object
-import uvicorn # REQUIRED: pip install uvicorn
-import aiosqlite  # REQUIRED: pip install aiosqlite
-import httpx # REQUIRED: pip install httpx
+from flask import Flask
+import uvicorn
+import aiosqlite
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -36,24 +31,26 @@ from telegram.ext import (
 
 # ----------------- CONFIG -----------------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-# NOTE: TELEGRAM_CHAT_ID must be a string (e.g., "-123456789") for comparison
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") 
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "10"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = "4.0.0-Secured-ASGI"
+VERSION = "1.0.0-Secured-ASGI"
 DB_PATH = os.environ.get("DB_PATH", "airdropvision_v4.db")
 
 # Sources Config
 NFTCALENDAR_API = "https://api.nftcalendar.io/upcoming"
 
-# Nitter Defaults
+# Nitter Defaults - UPDATED to include user-provided instances
 DEFAULT_NITTER_LIST = [
+    "https://nitter.tiekoetter.com",
+    "https://nitter.space",
+    "https://lightbrd.com",
+    "https://xcancel.com",
+    "https://nuku.trabun.org",
+    "https://nitter.privacyredirect.com",
     "https://nitter.net",
     "https://nitter.poast.org",
-    "https://nitter.privacydev.net",
-    "https://nitter.lucabased.xyz",
-    "https://nitter.uni-sonia.com",
 ]
 NITTER_INSTANCES_CSV = os.environ.get("NITTER_INSTANCES_CSV")
 NITTER_INSTANCES = [url.strip() for url in (NITTER_INSTANCES_CSV.split(',') if NITTER_INSTANCES_CSV else DEFAULT_NITTER_LIST) if url.strip()]
@@ -64,15 +61,21 @@ NITTER_SEARCH_QUERIES = [
     '("eth free mint") -filter:replies',
 ]
 
+# Scholarship scanner default sources (free sites / pages). You can add more with /addschsource
+DEFAULT_SCHOLARSHIP_SOURCES = [
+    "https://www.scholarship-positions.com/",
+    "https://www.scholarshipsads.com/",
+    "https://www.internships.com/"  # generic fallback - results may vary
+]
+
 # Spam Defaults
 DEFAULT_SPAM_KEYWORDS = "giveaway,retweet,follow,tag 3,like,rt,gleam.io,promo,dm me,whatsapp,telegram group"
-SPAM_WORDS: Set[str] = set()  # Populated from DB at runtime
+SPAM_WORDS: Set[str] = set()
 
 # Globals
 HTTP_TIMEOUT = 15
-HEALTHY_NITTER_INSTANCES = []
+HEALTHY_NITTER_INSTANCES: List[str] = []
 NITTER_CHECK_LOCK = asyncio.Lock()
-# http_client removed from global scope
 
 # ----------------- LOGGING -----------------
 logging.basicConfig(
@@ -82,7 +85,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(BOT_NAME)
 
-# ----------------- ASYNC DATABASE (aiosqlite) - UPGRADED -----------------
+# ----------------- ASYNC DATABASE (aiosqlite) -----------------
 CREATE_SEEN_SQL = """
 CREATE TABLE IF NOT EXISTS seen (
     id TEXT PRIMARY KEY,
@@ -110,7 +113,7 @@ class DB:
             async with aiosqlite.connect(self.path) as conn:
                 await conn.execute(CREATE_SEEN_SQL)
                 await conn.execute(CREATE_META_SQL)
-                conn.row_factory = aiosqlite.Row # UPGRADE: Enable column access by name
+                conn.row_factory = aiosqlite.Row
                 await conn.commit()
         self._init_done = True
 
@@ -134,16 +137,16 @@ class DB:
             async with aiosqlite.connect(self.path) as conn:
                 async with conn.execute("SELECT COUNT(1) FROM seen") as cur:
                     row = await cur.fetchone()
-                    return row[0] if row else 0 # count doesn't benefit from row_factory
+                    return row[0] if row else 0
 
     async def meta_get(self, k: str, default=None):
         if not self._init_done: await self.init()
         async with self._lock:
             async with aiosqlite.connect(self.path) as conn:
-                conn.row_factory = aiosqlite.Row # Ensure row factory is set on connection
+                conn.row_factory = aiosqlite.Row
                 async with conn.execute("SELECT v FROM meta WHERE k=?", (k,)) as cur:
                     row = await cur.fetchone()
-                    return row['v'] if row else default # UPGRADE: Access by name 'v'
+                    return row['v'] if row else default
 
     async def meta_set(self, k: str, v: str):
         if not self._init_done: await self.init()
@@ -160,6 +163,7 @@ class DB:
 
     async def meta_set_json(self, k: str, v: list):
         await self.meta_set(k, json.dumps(v))
+
 
 db = DB()
 
@@ -178,12 +182,12 @@ def is_spam(text: str) -> bool:
     text = text.lower()
     return any(w in text for w in SPAM_WORDS)
 
-# ----------------- HELPER: TELEGRAM SENDER (Pass http_client) -----------------
+# ----------------- HELPER: TELEGRAM SENDER -----------------
 async def send_telegram_async(http_client: httpx.AsyncClient, text: str, parse_mode=ParseMode.MARKDOWN):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": False}
-    
+
     for i in range(3):
         try:
             r = await http_client.post(url, json=payload)
@@ -196,15 +200,14 @@ async def send_telegram_async(http_client: httpx.AsyncClient, text: str, parse_m
             logger.error(f"Telegram send failed: {e}")
         await asyncio.sleep(1)
 
-# ----------------- SCANNER: NITTER HEALTH CHECK (Pass http_client) -----------------
+# ----------------- NITTER HEALTH & SCAN (unchanged behavior) -----------------
 async def check_nitter_health(http_client: httpx.AsyncClient):
     global HEALTHY_NITTER_INSTANCES
     logger.info("Checking Nitter instances health...")
-    
+
     async def check(instance):
         try:
             r = await http_client.get(f"{instance}/search?q=test", timeout=8)
-            # Check for 200 and relevant content in the page source
             if r.status_code == 200 and ("timeline" in r.text or "tweet" in r.text):
                 return instance
         except: pass
@@ -213,7 +216,7 @@ async def check_nitter_health(http_client: httpx.AsyncClient):
     tasks = [check(i) for i in NITTER_INSTANCES]
     results = await asyncio.gather(*tasks)
     healthy = [r for r in results if r]
-    
+
     async with NITTER_CHECK_LOCK:
         HEALTHY_NITTER_INSTANCES = healthy
     logger.info(f"Healthy Nitter instances: {len(healthy)}")
@@ -221,36 +224,30 @@ async def check_nitter_health(http_client: httpx.AsyncClient):
 async def nitter_health_loop(http_client: httpx.AsyncClient):
     while True:
         await check_nitter_health(http_client)
-        await asyncio.sleep(1800) # 30 mins
+        await asyncio.sleep(1800)
 
-# ----------------- SCANNER: NITTER (Pass http_client) -----------------
+# parsing helper for nitter (kept simple)
 def parse_nitter(html: str, base_url: str):
-    # This remains synchronous and uses to_thread correctly
     soup = BeautifulSoup(html, "lxml")
     results = []
     items = soup.find_all("div", class_="timeline-item")
     for item in items:
-        # ... (parsing logic remains the same)
         link = item.find("a", class_="tweet-link")
         if not link: continue
-        
         href = link.get("href", "")
         tweet_id = href.split("/")[-1].replace("#m", "")
         url = urllib.parse.urljoin(base_url, href)
-        
         content = item.find("div", class_="tweet-content")
         text = content.get_text(" ", strip=True) if content else ""
-        
         user_a = item.find("a", class_="username")
         user = user_a.get_text(strip=True) if user_a else "???"
-        
         results.append({"id": tweet_id, "url": url, "text": text, "user": user})
     return results
 
 async def scan_nitter(http_client: httpx.AsyncClient, limit=10):
     async with NITTER_CHECK_LOCK:
         instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
-    
+
     if not instances:
         logger.warning("No Nitter instances available.")
         return
@@ -261,48 +258,38 @@ async def scan_nitter(http_client: httpx.AsyncClient, limit=10):
                 url = f"{instance}/search?f=tweets&q={urllib.parse.quote(q)}"
                 r = await http_client.get(url)
                 if r.status_code != 200: continue
-                
-                # Use asyncio.to_thread for blocking BeautifulSoup
                 parsed = await asyncio.to_thread(parse_nitter, r.text, instance)
                 if not parsed: continue
-                
                 for t in parsed[:limit]:
                     if is_spam(t['text']):
                         logger.info(f"Spam skipped: {t['id']}")
                         continue
-                        
                     if await db.seen_add(f"nitter:{t['id']}", "nitter", t):
                         msg = f"🐦 *Twitter/Nitter*\n\n{t['text']}\n\n🔗 [Link]({t['url']})"
                         await send_telegram_async(http_client, msg)
                         await asyncio.sleep(0.5)
-                break 
+                break
             except Exception as e:
                 logger.debug(f"Nitter error {instance}: {e}")
         await asyncio.sleep(2)
 
-# ----------------- SCANNER: NFT CALENDAR (Pass http_client) -----------------
+# ----------------- NFT CALENDAR SCAN (unchanged) -----------------
 async def scan_calendar(http_client: httpx.AsyncClient, limit=MAX_RESULTS):
     try:
         r = await http_client.get(NFTCALENDAR_API)
         if r.status_code != 200: return
         data = r.json()
         items = data if isinstance(data, list) else (data.get("nfts") or data.get("data") or [])
-        
         for nft in items[:limit]:
             if not isinstance(nft, dict): continue
-            
             nid = str(nft.get("id") or nft.get("slug") or nft.get("name"))
             name = nft.get("name", "Unknown")
             desc = nft.get("description", "")
-            
             if is_spam(name + " " + desc): continue
-            
             price = str(nft.get("mint_price", "")).lower()
             is_free = "free" in price or "0" == price.strip() or nft.get("is_free")
-            
             if not is_free and "free" not in (name+desc).lower():
-                continue 
-                
+                continue
             if await db.seen_add(f"cal:{nid}", "calendar", nft):
                 url = nft.get("url") or nft.get("link") or "N/A"
                 date = nft.get("launch_date")
@@ -311,50 +298,45 @@ async def scan_calendar(http_client: httpx.AsyncClient, limit=MAX_RESULTS):
     except Exception as e:
         logger.error(f"Calendar scan error: {e}")
 
-# ----------------- MAIN SCHEDULER (Pass http_client) -----------------
+# ----------------- SCHEDULER -----------------
 async def scheduler_loop(http_client: httpx.AsyncClient):
     logger.info("Scheduler started.")
     while True:
         try:
             await scan_calendar(http_client)
             await scan_nitter(http_client)
+            await scan_scholarships(http_client)
             count = await db.seen_count()
             logger.info(f"Scan cycle complete. DB Size: {count}")
         except Exception as e:
             logger.error(f"Scheduler error: {e}")
         await asyncio.sleep(POLL_INTERVAL_MINUTES * 60)
 
-# ----------------- TELEGRAM UI & SECURITY - UPGRADED -----------------
+# ----------------- TELEGRAM UI & AUTH -----------------
 
 def is_authorized(chat_id: int) -> bool:
-    """UPGRADE: Check if the sender's chat ID matches the configured ID."""
     return str(chat_id) == str(TELEGRAM_CHAT_ID)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_chat.id): 
+    if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("🚫 Unauthorized chat.")
-    
     keyboard = [
         [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("⚙️ Filters", callback_data="filters")],
-        [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")]
+        [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now"), InlineKeyboardButton("🃏 Poker", callback_data="poker_start")]
     ]
     await update.message.reply_text(
-        f"🤖 *{BOT_NAME} v{VERSION}*\nActive & Scanning...", 
-        reply_markup=InlineKeyboardMarkup(keyboard), 
+        f"🤖 *{BOT_NAME} v{VERSION}*\nActive & Scanning...",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN
     )
 
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    if not is_authorized(query.message.chat_id): 
+    if not is_authorized(query.message.chat_id):
         return await query.edit_message_text("🚫 Unauthorized chat.")
-
     data = query.data
-    http_client = context.application.bot_data['http_client'] # Retrieve client from context
-
-    # ... (rest of the menu_handler logic remains similar, but now implicitly authorized)
+    http_client = context.application.bot_data['http_client']
 
     if data == "stats":
         count = await db.seen_count()
@@ -362,7 +344,6 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         healthy_count = 0
         async with NITTER_CHECK_LOCK:
             healthy_count = len(HEALTHY_NITTER_INSTANCES)
-            
         msg = f"📊 *Statistics*\n\nItems Tracked: `{count}`\nSpam Filters: `{spam_count}`\nNitter Nodes: `{healthy_count}`"
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]
         await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
@@ -394,27 +375,30 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "scan_now":
         await query.edit_message_text("🚀 Scanning now... please wait.")
-        # Pass http_client to manual scan
         asyncio.create_task(run_manual_scan(http_client, query.message.chat_id, context))
-    
+
+    elif data == "poker_start":
+        await query.edit_message_text("🃏 Starting Poker (Video Poker - single player)...")
+        asyncio.create_task(start_poker_game(context, query.message.chat_id))
+
     elif data == "main_menu":
         keyboard = [
             [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("⚙️ Filters", callback_data="filters")],
-            [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now")]
+            [InlineKeyboardButton("🚀 Force Scan", callback_data="scan_now"), InlineKeyboardButton("🃏 Poker", callback_data="poker_start")]
         ]
         await query.edit_message_text(f"🤖 *{BOT_NAME} v{VERSION}*\nActive & Scanning...", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
-
+# ----------------- MANUAL SCAN TRIGGER -----------------
 async def run_manual_scan(http_client: httpx.AsyncClient, chat_id, context):
     await scan_calendar(http_client)
     await scan_nitter(http_client)
+    await scan_scholarships(http_client)
     await context.bot.send_message(chat_id, "✅ Manual Scan Complete.")
 
-# --- Command Handlers for Filters ---
+# ----------------- FILTER COMMANDS -----------------
 async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_chat.id): 
+    if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("🚫 Unauthorized command.")
-    
     if not context.args: return await update.message.reply_text("Usage: `/addfilter <word>`", parse_mode=ParseMode.MARKDOWN)
     word = " ".join(context.args).lower().strip()
     await load_spam_words()
@@ -428,9 +412,8 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Filter `{word}` already exists.", parse_mode=ParseMode.MARKDOWN)
 
 async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_chat.id): 
+    if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("🚫 Unauthorized command.")
-
     if not context.args: return await update.message.reply_text("Usage: `/delfilter <word>`", parse_mode=ParseMode.MARKDOWN)
     word = " ".join(context.args).lower().strip()
     await load_spam_words()
@@ -443,50 +426,213 @@ async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"⚠️ Filter `{word}` not found.", parse_mode=ParseMode.MARKDOWN)
 
-# ----------------- FLASK & UVICORN (ASGI) HEALTHCHECK - UPGRADED -----------------
+# ----------------- FLASK & UVICORN -----------------
 flask_app = Flask(__name__)
 @flask_app.route("/health")
 def health(): return f"AirdropVision v{VERSION} OK", 200
 
-# Function to run Uvicorn server in the asyncio loop
 async def run_asgi_server():
-    """Runs the Flask app using Uvicorn as an ASGI server."""
     port = int(os.environ.get("PORT", 8080))
     config = uvicorn.Config(
-        flask_app, 
-        host="0.0.0.0", 
-        port=port, 
-        log_level="warning", 
+        flask_app,
+        host="0.0.0.0",
+        port=port,
+        log_level="warning",
         loop="asyncio"
     )
     server = uvicorn.Server(config)
-    
     logger.info(f"Starting ASGI server on port {port}...")
     await server.serve()
 
-# ----------------- BOOTSTRAP -----------------
+# ----------------- POKER MINI-GAME (Video Poker style) -----------------
+RANKS = ['2','3','4','5','6','7','8','9','10','J','Q','K','A']
+SUITS = ['♠','♥','♦','♣']
+
+def make_deck():
+    return [f"{r}{s}" for r in RANKS for s in SUITS]
+
+# Simple evaluator: returns a string label for the hand (not payouts)
+def evaluate_hand(cards: List[str]) -> str:
+    # cards: list of 5 like ['A♠','K♣', ...]
+    # Convert ranks to numbers
+    ranks = [c[:-1] for c in cards]
+    suits = [c[-1] for c in cards]
+    rank_counts = {}
+    for r in ranks:
+        rank_counts[r] = rank_counts.get(r, 0) + 1
+    counts = sorted(rank_counts.values(), reverse=True)
+    is_flush = len(set(suits)) == 1
+    # map ranks to indices for straight detection
+    idxs = sorted([RANKS.index(r) for r in ranks])
+    is_straight = False
+    if len(set(ranks)) == 5:
+        if idxs[-1] - idxs[0] == 4:
+            is_straight = True
+        # wheel straight A-2-3-4-5
+        if set(ranks) == set(['A','2','3','4','5']):
+            is_straight = True
+    if is_straight and is_flush:
+        return "Straight Flush"
+    if counts[0] == 4:
+        return "Four of a Kind"
+    if counts[0] == 3 and counts[1] == 2:
+        return "Full House"
+    if is_flush:
+        return "Flush"
+    if is_straight:
+        return "Straight"
+    if counts[0] == 3:
+        return "Three of a Kind"
+    if counts[0] == 2 and counts[1] == 2:
+        return "Two Pair"
+    if counts[0] == 2:
+        return "One Pair"
+    return "High Card"
+
+async def start_poker_game(context, chat_id):
+    # Single-player: deal 5 cards, let player hold via inline buttons, then draw and evaluate
+    deck = make_deck()
+    random.shuffle(deck)
+    hand = [deck.pop() for _ in range(5)]
+    game_id = f"poker:{chat_id}:{int(datetime.utcnow().timestamp())}"
+    # store in bot_data
+    context.application.bot_data[game_id] = {"deck": deck, "hand": hand}
+
+    kb = []
+    for i, card in enumerate(hand):
+        kb.append([InlineKeyboardButton(f"{card}", callback_data=f"poker_toggle:{game_id}:{i}")])
+    kb.append([InlineKeyboardButton("Draw", callback_data=f"poker_draw:{game_id}"), InlineKeyboardButton("Cancel", callback_data=f"poker_cancel:{game_id}")])
+    await context.bot.send_message(chat_id, f"🃏 *Your Hand*:\n{' '.join(hand)}\n\nTap cards to HOLD/UNHOLD, then press Draw.", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+
+async def poker_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    parts = data.split(":")
+    if parts[0] == "poker_toggle":
+        _, game_id, idx = parts
+        idx = int(idx)
+        state = context.application.bot_data.get(game_id)
+        if not state:
+            return await query.edit_message_text("Game expired or not found.")
+        held = state.get("held", set())
+        if isinstance(held, set): held = set(held)
+        if idx in held:
+            held.remove(idx)
+        else:
+            held.add(idx)
+        state['held'] = held
+        hand = state['hand']
+        kb = []
+        for i, card in enumerate(hand):
+            label = card + (" [H]" if i in held else "")
+            kb.append([InlineKeyboardButton(label, callback_data=f"poker_toggle:{game_id}:{i}")])
+        kb.append([InlineKeyboardButton("Draw", callback_data=f"poker_draw:{game_id}"), InlineKeyboardButton("Cancel", callback_data=f"poker_cancel:{game_id}")])
+        await query.edit_message_text(f"🃏 *Your Hand*:\n{' '.join(hand)}\n\nHeld: {sorted(list(held))}", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+
+    elif parts[0] == "poker_draw":
+        _, game_id = parts[0], parts[1]
+        state = context.application.bot_data.pop(game_id, None)
+        if not state:
+            return await query.edit_message_text("Game expired or not found.")
+        deck = state['deck']
+        hand = state['hand']
+        held = state.get('held', set()) or set()
+        # draw for non-held cards
+        for i in range(5):
+            if i not in held:
+                if not deck:
+                    deck = make_deck(); random.shuffle(deck)
+                hand[i] = deck.pop()
+        result = evaluate_hand(hand)
+        await query.edit_message_text(f"🃏 *Final Hand*:\n{' '.join(hand)}\n\n*Result:* {result}", parse_mode=ParseMode.MARKDOWN)
+
+    elif parts[0] == "poker_cancel":
+        _, game_id = parts
+        context.application.bot_data.pop(game_id, None)
+        await query.edit_message_text("🃏 Poker game canceled.")
+
+# ----------------- SCHOLARSHIP SCANNER -----------------
+async def get_scholarship_sources() -> List[str]:
+    stored = await db.meta_get_json("scholarship_sources", [])
+    if not stored:
+        await db.meta_set_json("scholarship_sources", DEFAULT_SCHOLARSHIP_SOURCES)
+        return DEFAULT_SCHOLARSHIP_SOURCES
+    return stored
+
+async def add_scholarship_source(url: str):
+    url = url.strip()
+    sources = await get_scholarship_sources()
+    if url not in sources:
+        sources.append(url)
+        await db.meta_set_json("scholarship_sources", sources)
+
+async def scan_scholarships(http_client: httpx.AsyncClient, limit_per_site=10):
+    sources = await get_scholarship_sources()
+    keywords = ["fully funded", "fully-funded", "fullyfunded", "scholarship"]
+    for s in sources:
+        try:
+            r = await http_client.get(s, timeout=HTTP_TIMEOUT)
+            if r.status_code != 200: continue
+            soup = BeautifulSoup(r.text, "lxml")
+            links = soup.find_all('a')
+            found = 0
+            for a in links:
+                if found >= limit_per_site: break
+                text = (a.get_text(" ", strip=True) or "").lower()
+                href = a.get('href') or ''
+                if any(k in text for k in keywords) or any(k in href.lower() for k in keywords):
+                    url = urllib.parse.urljoin(s, href)
+                    uniq_id = f"sch:{url}"
+                    if await db.seen_add(uniq_id, "scholarship", {"title": text, "url": url, "source": s}):
+                        msg = f"🎓 *Scholarship (likely fully funded)*\n\n{text}\n\n🔗 [Link]({url})\nSource: {s}"
+                        await send_telegram_async(http_client, msg)
+                        found += 1
+        except Exception as e:
+            logger.debug(f"Scholarship scan error for {s}: {e}")
+
+# ----------------- SCHOLARSHIP COMMANDS -----------------
+async def add_sch_source_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_chat.id):
+        return await update.message.reply_text("🚫 Unauthorized command.")
+    if not context.args: return await update.message.reply_text("Usage: `/addschsource <url>`", parse_mode=ParseMode.MARKDOWN)
+    url = context.args[0]
+    await add_scholarship_source(url)
+    await update.message.reply_text(f"✅ Added scholarship source: {url}")
+
+async def list_sch_sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_chat.id):
+        return await update.message.reply_text("🚫 Unauthorized command.")
+    sources = await get_scholarship_sources()
+    text = "🎓 *Scholarship Sources:*\n\n" + "\n".join(sources)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+async def force_scholarships_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_chat.id):
+        return await update.message.reply_text("🚫 Unauthorized command.")
+    http_client = context.application.bot_data['http_client']
+    await update.message.reply_text("🔎 Scanning scholarship sources now...")
+    await scan_scholarships(http_client)
+    await update.message.reply_text("✅ Scholarship scan complete.")
+
+# ----------------- BOOTSTRAP / MAIN -----------------
 async def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("Error: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set.")
         return
 
-    # UPGRADE: httpx.AsyncClient as a context manager
     async with httpx.AsyncClient(
         headers={"User-Agent": f"Mozilla/5.0 (compatible; {BOT_NAME}/{VERSION})"},
         timeout=HTTP_TIMEOUT,
         follow_redirects=True,
     ) as http_client:
 
-        # Init DB and config
         await db.init()
         await load_spam_words()
 
-        # UPGRADE: ASGI Server as an asyncio Task
         asgi_server_task = asyncio.create_task(run_asgi_server())
 
-        # Telegram App Setup
         app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        # UPGRADE: Store http_client in bot_data for use in handlers (e.g., scan_now)
         app.bot_data['http_client'] = http_client
 
         app.add_handler(CommandHandler("start", start_cmd))
@@ -494,35 +640,38 @@ async def main():
         app.add_handler(CommandHandler("delfilter", del_filter_cmd))
         app.add_handler(CallbackQueryHandler(menu_handler))
 
-        # Background Tasks (Pass http_client explicitly)
+        # Poker handlers (callback-based)
+        app.add_handler(CallbackQueryHandler(poker_callback_handler, pattern=r"^poker_"))
+
+        # Scholarship commands
+        app.add_handler(CommandHandler("addschsource", add_sch_source_cmd))
+        app.add_handler(CommandHandler("listschsources", list_sch_sources_cmd))
+        app.add_handler(CommandHandler("scholarships", force_scholarships_cmd))
+
+        # Background Tasks
         health_checker = asyncio.create_task(nitter_health_loop(http_client))
         scheduler = asyncio.create_task(scheduler_loop(http_client))
 
-        # Start Bot
         logger.info(f"Bot {VERSION} initialized. Polling...")
-        
+
         await app.initialize()
         await app.updater.start_polling()
         await app.start()
-        
-        # Keep main alive until interrupted
+
         try:
             await asyncio.gather(health_checker, scheduler, asgi_server_task, return_exceptions=True)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.error(f"Main loop error: {e}")
-            
         finally:
             logger.info("Stopping components...")
-            # Cleanup
             scheduler.cancel()
             health_checker.cancel()
             asgi_server_task.cancel()
             await app.updater.stop()
             await app.stop()
             await app.shutdown()
-            # httpx.AsyncClient is closed by the `async with` block
 
 if __name__ == "__main__":
     try:
@@ -530,5 +679,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Program exited gracefully.")
         pass
-
 
