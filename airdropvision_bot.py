@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-AirdropVision v2.0 — RSS BRIDGE EDITION
-REPLACED: Nitter scraping with RSS Bridge + TwitterV2Bridge
-ADDED: Twitter API v2 integration via RSS Bridge
-IMPROVED: Much more reliable and structured data
+AirdropVision v1.1 — ENHANCED NITTER RESILIENCE EDITION
+FIXED: Flask import and syntax errors
+UPDATED: More reliable Nitter instances and better error handling
 """
 
 import logging
@@ -13,12 +12,14 @@ import uvicorn
 import os
 import json
 import urllib.parse
-import xml.etree.ElementTree as ET
+import random
 from typing import List, Dict, Set, Optional
-from datetime import datetime, timedelta
 
 # External dependencies
 import aiosqlite
+from bs4 import BeautifulSoup
+from flask import Flask  # FIXED: Added Flask import
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -39,17 +40,20 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "15"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = "2.0.0"  # Major version update
-DB_PATH = os.environ.get("DB_PATH", "airdropvision_v6.db")
+VERSION = "1.1.0"
+DB_PATH = os.environ.get("DB_PATH", "airdropvision_v5.db")
 HTTP_TIMEOUT = 30
 
-# --- RSS Bridge Config ---
-RSS_BRIDGE_URL = os.environ.get("RSS_BRIDGE_URL", "http://localhost")
-RSS_BRIDGE_INSTANCES = [
-    instance.strip() for instance in 
-    os.environ.get("RSS_BRIDGE_INSTANCES", "https://rss-bridge.org/bridge.php,http://localhost:3000").split(',')
-    if instance.strip()
+# --- Nitter Config - UPDATED INSTANCES ---
+DEFAULT_NITTER_LIST = [
+    "https://nitter.privacyredirect.com",
+    "https://nitter.poast.org",
+    "https://nitter.fdn.fr", 
+    "https://nitter.1d4.us",
+    "https://nitter.kavin.rocks"
 ]
+NITTER_INSTANCES_CSV = os.environ.get("NITTER_INSTANCES_CSV")
+NITTER_INSTANCES = [url.strip() for url in (NITTER_INSTANCES_CSV.split(',') if NITTER_INSTANCES_CSV else DEFAULT_NITTER_LIST) if url.strip()]
 
 # Custom Queries Defaults
 DEFAULT_CUSTOM_QUERIES = [
@@ -62,8 +66,8 @@ DEFAULT_SPAM_KEYWORDS = ""
 
 # --- Global State & Locks ---
 SPAM_WORDS: Set[str] = set()
-HEALTHY_RSS_BRIDGE_INSTANCES: List[str] = []
-BRIDGE_CHECK_LOCK = asyncio.Lock()
+HEALTHY_NITTER_INSTANCES: List[str] = []
+NITTER_CHECK_LOCK = asyncio.Lock()
 FILTER_LOCK = asyncio.Lock()
 QUERY_LOCK = asyncio.Lock()
 
@@ -157,9 +161,10 @@ class DB:
 db = DB()
 
 # ----------------------------------------------------------------------
-## 3. 🕸️ RSS BRIDGE INTEGRATION
+## 3. 🕸️ SCRAPERS & BACKGROUND LOOPS
 # ----------------------------------------------------------------------
 
+# ----------------- TELEGRAM SENDER -----------------
 async def send_telegram_async(http_client: httpx.AsyncClient, text: str, parse_mode="Markdown"):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: 
         logger.warning("TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set. Skipping send.")
@@ -208,201 +213,169 @@ async def get_custom_nitter_queries() -> List[str]:
         return DEFAULT_CUSTOM_QUERIES
     return stored
 
-# ----------------- RSS BRIDGE INTEGRATION -----------------
-def parse_rss_feed(xml_content: str) -> List[Dict]:
-    """Parse RSS/Atom feed from RSS Bridge"""
-    try:
-        root = ET.fromstring(xml_content)
-        items = []
-        
-        # Handle both RSS and Atom formats
-        if root.tag.endswith('rss'):
-            # RSS format
-            for item in root.findall('.//item'):
-                title_elem = item.find('title')
-                link_elem = item.find('link')
-                guid_elem = item.find('guid')
-                description_elem = item.find('description')
-                
-                if guid_elem is not None and guid_elem.text:
-                    tweet_id = guid_elem.text.split('/')[-1] if 'twitter.com' in guid_elem.text else guid_elem.text
-                else:
-                    # Extract from link if no GUID
-                    link = link_elem.text if link_elem is not None else ""
-                    tweet_id = link.split('/')[-1] if 'twitter.com' in link else ""
-                
-                items.append({
-                    'id': tweet_id,
-                    'url': link_elem.text if link_elem is not None else "",
-                    'text': f"{title_elem.text if title_elem is not None else ''} - {description_elem.text if description_elem is not None else ''}",
-                    'title': title_elem.text if title_elem is not None else "",
-                    'description': description_elem.text if description_elem is not None else ""
-                })
-        else:
-            # Atom format
-            for entry in root.findall('.//{http://www.w3.org/2005/Atom}entry'):
-                title_elem = entry.find('{http://www.w3.org/2005/Atom}title')
-                link_elem = entry.find('{http://www.w3.org/2005/Atom}link')
-                id_elem = entry.find('{http://www.w3.org/2005/Atom}id')
-                content_elem = entry.find('{http://www.w3.org/2005/Atom}content')
-                
-                tweet_id = id_elem.text.split('/')[-1] if id_elem is not None and 'twitter.com' in id_elem.text else ""
-                
-                items.append({
-                    'id': tweet_id,
-                    'url': link_elem.get('href') if link_elem is not None else "",
-                    'text': f"{title_elem.text if title_elem is not None else ''} - {content_elem.text if content_elem is not None else ''}",
-                    'title': title_elem.text if title_elem is not None else "",
-                    'description': content_elem.text if content_elem is not None else ""
-                })
-        
-        return items
-    except Exception as e:
-        logger.error(f"Error parsing RSS feed: {e}")
-        return []
+# ----------------- NITTER/TWITTER - ENHANCED -----------------
+def parse_nitter(html: str, base_url: str):
+    soup = BeautifulSoup(html, "lxml")
+    results = []
+    items = soup.find_all("div", class_="timeline-item")
+    for item in items:
+        link = item.find("a", class_="tweet-link")
+        if not link: continue
+        href = link.get("href", "")
+        tweet_id = href.split("/")[-1].replace("#m", "")
+        url = urllib.parse.urljoin(base_url, href)
+        content = item.find("div", class_="tweet-content")
+        text = content.get_text(" ", strip=True) if content else ""
+        results.append({"id": tweet_id, "url": url, "text": text})
+    return results
 
-async def check_rss_bridge_health(http_client: httpx.AsyncClient):
-    """Check RSS Bridge instances health"""
-    logger.info("Checking RSS Bridge instances health...")
+async def check_nitter_health_enhanced(http_client: httpx.AsyncClient):
+    """Enhanced health check with better error handling"""
+    logger.info("Checking Nitter instances health...")
+    
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+    ]
     
     async def check(instance):
         try:
-            # Test with a simple TwitterV2Bridge request
-            test_url = f"{instance}?action=display&bridge=TwitterV2Bridge&q=test&format=Json"
-            r = await http_client.get(test_url, timeout=10)
-            if r.status_code == 200:
-                logger.debug(f"✅ RSS Bridge healthy: {instance}")
+            headers = {"User-Agent": random.choice(user_agents)}
+            r = await http_client.get(
+                f"{instance}/search?q=test", 
+                timeout=10,
+                headers=headers
+            )
+            if r.status_code == 200 and ("timeline" in r.text or "tweet" in r.text):
+                logger.debug(f"✅ Instance healthy: {instance}")
                 return instance
             else:
-                logger.warning(f"❌ RSS Bridge {instance} returned status {r.status_code}")
+                logger.warning(f"❌ Instance {instance} returned status {r.status_code}")
                 return None
         except Exception as e:
-            logger.debug(f"❌ RSS Bridge {instance} failed: {e}")
+            logger.debug(f"❌ Instance {instance} failed: {e}")
             return None
 
-    tasks = [check(i) for i in RSS_BRIDGE_INSTANCES]
+    tasks = [check(i) for i in NITTER_INSTANCES]
     results = await asyncio.gather(*tasks)
     healthy = [r for r in results if r]
     
-    global HEALTHY_RSS_BRIDGE_INSTANCES
-    async with BRIDGE_CHECK_LOCK:
-        HEALTHY_RSS_BRIDGE_INSTANCES = healthy
+    global HEALTHY_NITTER_INSTANCES
+    async with NITTER_CHECK_LOCK:
+        HEALTHY_NITTER_INSTANCES = healthy
         
-    logger.info(f"Healthy RSS Bridge instances: {len(healthy)}")
+    logger.info(f"Healthy Nitter instances: {len(healthy)}")
     if healthy:
         logger.info(f"Working instances: {healthy}")
     else:
-        logger.error("No healthy RSS Bridge instances available!")
+        logger.error("No healthy Nitter instances available!")
     
     return healthy
 
-async def scan_rss_bridge_query(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str):
-    """Scan using RSS Bridge TwitterV2Bridge"""
+async def nitter_health_loop(http_client: httpx.AsyncClient):
+    while True:
+        await check_nitter_health_enhanced(http_client)
+        await asyncio.sleep(600)
+
+async def scan_nitter_query_enhanced(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str, max_retries=2):
+    """Enhanced scanner with retry logic"""
     if not queries:
         logger.debug(f"Skipping {tag} scan (no queries provided).")
         return
 
-    # Get healthy instances
-    async with BRIDGE_CHECK_LOCK:
-        instances = HEALTHY_RSS_BRIDGE_INSTANCES or RSS_BRIDGE_INSTANCES
+    async with NITTER_CHECK_LOCK:
+        instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
         
     if not instances:
-        logger.warning(f"No RSS Bridge instances for {tag} scan.")
-        instances = await check_rss_bridge_health(http_client)
+        logger.warning(f"No Nitter instances for {tag} scan.")
+        instances = await check_nitter_health_enhanced(http_client)
         if not instances:
             logger.error("Still no healthy instances after refresh. Skipping scan.")
             return
 
-    for query in queries:
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    ]
+
+    for q in queries:
         success = False
-        for instance in instances:
-            try:
-                # Use TwitterV2Bridge with JSON format for easier parsing
-                url = f"{instance}?action=display&bridge=TwitterV2Bridge&q={urllib.parse.quote(query)}&format=Json"
-                logger.info(f"Scanning RSS Bridge: {query}")
-                
-                r = await http_client.get(url, timeout=HTTP_TIMEOUT)
-                
-                if r.status_code == 200:
-                    try:
-                        # Try to parse as JSON first
-                        data = r.json()
-                        if 'items' in data:
-                            items = data['items']
+        for retry in range(max_retries):
+            random.shuffle(instances)
+            for instance in instances:
+                try:
+                    headers = {"User-Agent": random.choice(user_agents)}
+                    url = f"{instance}/search?f=tweets&q={urllib.parse.quote(q)}"
+                    logger.debug(f"Trying {instance} for query: {q}")
+                    
+                    r = await http_client.get(url, timeout=HTTP_TIMEOUT, headers=headers)
+                    
+                    if r.status_code == 200:
+                        parsed = await asyncio.to_thread(parse_nitter, r.text, instance)
+                        if parsed:
+                            logger.info(f"✅ Found {len(parsed)} results from {instance} for: {q}")
+                            
+                            for t in parsed[:MAX_RESULTS]:
+                                if is_spam(t['text']):
+                                    continue
+                                if await db.seen_add(f"{db_kind}:{t['id']}", db_kind, t):
+                                    msg = f"{tag} (Query: `{q}`)\n\n{t['text']}\n\n🔗 [Link]({t['url']})"
+                                    await send_telegram_async(http_client, msg)
+                                    await asyncio.sleep(1)
+                            
+                            success = True
+                            break
                         else:
-                            # Fallback to RSS parsing
-                            items = parse_rss_feed(r.text)
-                    except:
-                        # Fallback to RSS parsing if JSON fails
-                        items = parse_rss_feed(r.text)
-                    
-                    if items:
-                        logger.info(f"✅ Found {len(items)} results for: {query}")
-                        
-                        for item in items[:MAX_RESULTS]:
-                            if not item.get('id'):
-                                continue
-                                
-                            if is_spam(item.get('text', '')):
-                                continue
-                                
-                            if await db.seen_add(f"{db_kind}:{item['id']}", db_kind, item):
-                                # Construct a clean message
-                                tweet_text = item.get('text') or item.get('title') or item.get('description', '')
-                                msg = f"{tag} (Query: `{query}`)\n\n{tweet_text}\n\n🔗 [Link]({item['url']})"
-                                await send_telegram_async(http_client, msg)
-                                await asyncio.sleep(1)
-                        
-                        success = True
-                        break  # Success with this instance, move to next query
+                            logger.debug(f"No results from {instance} for query: {q}")
+                    elif r.status_code == 429:
+                        logger.warning(f"Rate limited by {instance}, will retry other instances")
+                        continue
                     else:
-                        logger.debug(f"No results from RSS Bridge for query: {query}")
-                else:
-                    logger.warning(f"RSS Bridge {instance} returned {r.status_code} for query: {query}")
-                    
-            except Exception as e:
-                logger.error(f"RSS Bridge error {instance}: {e}")
+                        logger.warning(f"Instance {instance} returned {r.status_code} for query: {q}")
+                        
+                except Exception as e:
+                    logger.debug(f"Nitter error {instance}: {e}")
+            
+            if success:
+                break
+            else:
+                logger.warning(f"Query '{q}' failed on all instances, retry {retry + 1}/{max_retries}")
+                if retry < max_retries - 1:
+                    await asyncio.sleep(10 * (retry + 1))
         
-        # Delay between queries
-        await asyncio.sleep(5)
+        await asyncio.sleep(8)
 
 # ----------------- MAIN SCHEDULERS -----------------
 async def scheduler_loop(http_client: httpx.AsyncClient):
-    logger.info("RSS Bridge scheduler started.")
+    logger.info("Scheduler started.")
     while True:
         try:
             custom_queries = await get_custom_nitter_queries()
-            await scan_rss_bridge_query(http_client, custom_queries, "rss_bridge", "🐦 *RSS Bridge Airdrop*")
+            await scan_nitter_query_enhanced(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
             
             count = await db.seen_count()
-            logger.info(f"RSS Bridge scan cycle complete. DB Size: {count}")
+            logger.info(f"Scan cycle complete. DB Size: {count}")
         except Exception as e:
-            logger.error(f"RSS Bridge scheduler error: {e}")
+            logger.error(f"Scheduler error: {e}")
         await asyncio.sleep(POLL_INTERVAL_MINUTES * 60)
 
 async def run_manual_scan(http_client: httpx.AsyncClient, chat_id: int, context):
-    await context.bot.send_message(chat_id, "🚀 RSS Bridge manual scan initiated...")
+    await context.bot.send_message(chat_id, "🚀 Manual scan initiated...")
     try:
         custom_queries = await get_custom_nitter_queries()
-        await scan_rss_bridge_query(http_client, custom_queries, "rss_bridge", "🐦 *RSS Bridge Airdrop*")
+        await scan_nitter_query_enhanced(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
         
-        await context.bot.send_message(chat_id, "✅ RSS Bridge Manual Scan Complete.")
+        await context.bot.send_message(chat_id, "✅ Manual Scan Complete.")
     except Exception as e:
-        logger.error(f"RSS Bridge manual scan error: {e}")
-        await context.bot.send_message(chat_id, f"⚠️ RSS Bridge Manual Scan Failed: {e}")
-
-async def rss_bridge_health_loop(http_client: httpx.AsyncClient):
-    while True:
-        await check_rss_bridge_health(http_client)
-        await asyncio.sleep(600)  # Check every 10 minutes
+        logger.error(f"Manual scan error: {e}")
+        await context.bot.send_message(chat_id, f"⚠️ Manual Scan Failed: {e}")
 
 # ----------------------------------------------------------------------
-## 4. 🤖 TELEGRAM BOT & UI LOGIC (UNCHANGED)
+## 4. 🤖 TELEGRAM BOT & UI LOGIC
 # ----------------------------------------------------------------------
 
-# [The rest of your Telegram bot code remains exactly the same - only the backend scanning changed]
-# Including: auth_guard, menu generators, command handlers, callback router, etc.
-
+# ----------------- AUTH HELPER -----------------
 def is_authorized(chat_id: int) -> bool:
     return str(chat_id) == str(TELEGRAM_CHAT_ID)
 
@@ -417,8 +390,9 @@ async def auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
         return False
     return True
 
+# ----------------- UI/MENU GENERATORS -----------------
 async def get_main_menu():
-    text = f"✨ *{BOT_NAME} v{VERSION} | RSS Bridge Edition*\n\nChoose an option to manage the bot's operation:"
+    text = f"✨ *{BOT_NAME} v{VERSION} | Main Menu*\n\nChoose an option to manage the bot's operation:"
     keyboard = [
         [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
         [InlineKeyboardButton("🐦 Custom Queries", callback_data="queries_menu")],
@@ -431,23 +405,74 @@ async def get_stats_menu():
     count = await db.seen_count()
     spam_count = len(SPAM_WORDS)
     queries_count = len(await get_custom_nitter_queries())
-    async with BRIDGE_CHECK_LOCK:
-        healthy_count = len(HEALTHY_RSS_BRIDGE_INSTANCES)
+    async with NITTER_CHECK_LOCK:
+        healthy_count = len(HEALTHY_NITTER_INSTANCES)
     
     text = (
         "📊 *Bot Statistics*\n\n"
         f"➡️ **Items Tracked:** `{count}`\n"
         f"➡️ **Custom Queries:** `{queries_count}`\n"
         f"➡️ **Spam Filters:** `{spam_count}`\n"
-        f"➡️ **Healthy RSS Bridge Nodes:** `{healthy_count}`\n"
-        f"➡️ **Version:** `{VERSION} (RSS Bridge Edition)`"
+        f"➡️ **Healthy Nitter Nodes:** `{healthy_count}`\n"
+        f"➡️ **Version:** `{VERSION}`"
     )
     keyboard = [[InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]]
     return text, InlineKeyboardMarkup(keyboard)
 
-# [Keep all your existing menu functions, command handlers, and callback router exactly as they are]
-# Only replace the Nitter-specific functions with RSS Bridge equivalents
+async def get_queries_menu():
+    text = "🐦 *Custom Nitter Queries*\n\nManage the search queries used for the bot's scanning."
+    kb = [
+        [InlineKeyboardButton("📜 View All Queries", callback_data="list_queries")],
+        [InlineKeyboardButton("➕ Add Query", callback_data="add_query_input"), InlineKeyboardButton("➖ Delete Query", callback_data="del_query_input")],
+        [InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]
+    ]
+    return text, InlineKeyboardMarkup(kb)
 
+async def get_list_queries_menu():
+    queries = await get_custom_nitter_queries()
+    text = "📜 *Active Nitter Search Queries:*\n\n" + "\n".join([f"• `{q}`" for q in queries])
+    if not queries: text = "No custom queries set."
+    
+    kb = [[InlineKeyboardButton("🔙 Back to Queries Menu", callback_data="queries_menu")]]
+    return text, InlineKeyboardMarkup(kb)
+
+async def get_filters_menu():
+    text = "🚫 *Spam Filters*\n\nKeywords added here will block a tweet from being posted."
+    kb = [
+        [InlineKeyboardButton("📜 View All Filters", callback_data="list_filters")],
+        [InlineKeyboardButton("➕ Add Filter", callback_data="add_filter_input"), InlineKeyboardButton("➖ Delete Filter", callback_data="del_filter_input")],
+        [InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]
+    ]
+    return text, InlineKeyboardMarkup(kb)
+
+async def get_list_filters_menu():
+    await load_spam_words()
+    text = "📜 *Active Spam Keywords:*\n\n" + "\n".join([f"• `{w}`" for w in sorted(list(SPAM_WORDS))])
+    if not SPAM_WORDS: text = "No filters set."
+    
+    kb = [[InlineKeyboardButton("🔙 Back to Filters Menu", callback_data="filters_menu")]]
+    return text, InlineKeyboardMarkup(kb)
+
+async def get_command_input_menu(action: str):
+    if action == "add_query":
+        text = "➕ *Add Query*\n\nTo add a query, **type the command** below:\n\n`/addquery <full_twitter_search_query>`"
+        back_data = "queries_menu"
+    elif action == "del_query":
+        text = "➖ *Delete Query*\n\nTo remove a query, **type the command** below:\n\n`/delquery <full_twitter_search_query>`"
+        back_data = "queries_menu"
+    elif action == "add_filter":
+        text = "➕ *Add Filter*\n\nTo add a filter, **type the command** below:\n\n`/addfilter <word>`"
+        back_data = "filters_menu"
+    elif action == "del_filter":
+        text = "➖ *Delete Filter*\n\nTo remove a filter, **type the command** below:\n\n`/delfilter <word>`"
+        back_data = "filters_menu"
+    else:
+        return "Error: Unknown action.", InlineKeyboardMarkup([])
+
+    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data=back_data)]]
+    return text, InlineKeyboardMarkup(kb)
+
+# ----------------- COMMAND HANDLERS -----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context): return
     text, markup = await get_main_menu()
@@ -527,6 +552,7 @@ async def del_query_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"⚠️ Query `{query}` not found.", parse_mode=ParseMode.MARKDOWN)
 
+# ----------------- CALLBACK ROUTER -----------------
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context): return
     
@@ -556,7 +582,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "del_filter_input":
         text, markup = await get_command_input_menu("del_filter")
     elif data == "scan_now":
-        await query.edit_message_text("🚀 RSS Bridge scanning now... this may take a moment.")
+        await query.edit_message_text("🚀 Scanning now... this may take a moment.")
         http_client = context.application.bot_data['http_client']
         asyncio.create_task(run_manual_scan(http_client, query.message.chat_id, context))
         return
@@ -567,61 +593,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
-async def get_queries_menu():
-    text = "🐦 *Custom Twitter Queries*\n\nManage the search queries used for RSS Bridge scanning."
-    kb = [
-        [InlineKeyboardButton("📜 View All Queries", callback_data="list_queries")],
-        [InlineKeyboardButton("➕ Add Query", callback_data="add_query_input"), InlineKeyboardButton("➖ Delete Query", callback_data="del_query_input")],
-        [InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]
-    ]
-    return text, InlineKeyboardMarkup(kb)
-
-async def get_list_queries_menu():
-    queries = await get_custom_nitter_queries()
-    text = "📜 *Active Twitter Search Queries:*\n\n" + "\n".join([f"• `{q}`" for q in queries])
-    if not queries: text = "No custom queries set."
-    
-    kb = [[InlineKeyboardButton("🔙 Back to Queries Menu", callback_data="queries_menu")]]
-    return text, InlineKeyboardMarkup(kb)
-
-async def get_filters_menu():
-    text = "🚫 *Spam Filters*\n\nKeywords added here will block a tweet from being posted."
-    kb = [
-        [InlineKeyboardButton("📜 View All Filters", callback_data="list_filters")],
-        [InlineKeyboardButton("➕ Add Filter", callback_data="add_filter_input"), InlineKeyboardButton("➖ Delete Filter", callback_data="del_filter_input")],
-        [InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]
-    ]
-    return text, InlineKeyboardMarkup(kb)
-
-async def get_list_filters_menu():
-    await load_spam_words()
-    text = "📜 *Active Spam Keywords:*\n\n" + "\n".join([f"• `{w}`" for w in sorted(list(SPAM_WORDS))])
-    if not SPAM_WORDS: text = "No filters set."
-    
-    kb = [[InlineKeyboardButton("🔙 Back to Filters Menu", callback_data="filters_menu")]]
-    return text, InlineKeyboardMarkup(kb)
-
-async def get_command_input_menu(action: str):
-    if action == "add_query":
-        text = "➕ *Add Query*\n\nTo add a query, **type the command** below:\n\n`/addquery <full_twitter_search_query>`"
-        back_data = "queries_menu"
-    elif action == "del_query":
-        text = "➖ *Delete Query*\n\nTo remove a query, **type the command** below:\n\n`/delquery <full_twitter_search_query>`"
-        back_data = "queries_menu"
-    elif action == "add_filter":
-        text = "➕ *Add Filter*\n\nTo add a filter, **type the command** below:\n\n`/addfilter <word>`"
-        back_data = "filters_menu"
-    elif action == "del_filter":
-        text = "➖ *Delete Filter*\n\nTo remove a filter, **type the command** below:\n\n`/delfilter <word>`"
-        back_data = "filters_menu"
-    else:
-        return "Error: Unknown action.", InlineKeyboardMarkup([])
-
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data=back_data)]]
-    return text, InlineKeyboardMarkup(kb)
-
 # ----------------- FLASK & UVICORN -----------------
+# FIXED: Proper Flask app definition
 flask_app = Flask(__name__)
+
 @flask_app.route("/health")
 def health():
     return f"{BOT_NAME} v{VERSION} OK", 200
@@ -656,8 +631,8 @@ async def main():
         await load_spam_words()
         await get_custom_nitter_queries()
 
-        # Initial RSS Bridge health check
-        await check_rss_bridge_health(http_client)
+        # Initial health check
+        await check_nitter_health_enhanced(http_client)
 
         # Start the web server
         asgi_server_task = asyncio.create_task(run_asgi_server())
@@ -675,10 +650,10 @@ async def main():
         app.add_handler(CallbackQueryHandler(callback_router))
 
         # --- Background Tasks ---
-        health_checker = asyncio.create_task(rss_bridge_health_loop(http_client))
+        health_checker = asyncio.create_task(nitter_health_loop(http_client))
         scheduler = asyncio.create_task(scheduler_loop(http_client))
 
-        logger.info(f"Bot {VERSION} (RSS Bridge Edition) initialized. Starting polling...")
+        logger.info(f"Bot {VERSION} initialized. Starting polling...")
         
         await app.initialize()
         await app.updater.start_polling()
@@ -701,7 +676,6 @@ async def main():
                 if not task.done():
                     task.cancel()
             logger.info("Bot shut down gracefully.")
-
 
 if __name__ == "__main__":
     try:
