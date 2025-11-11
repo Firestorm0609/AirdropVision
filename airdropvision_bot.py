@@ -257,7 +257,7 @@ async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): if
 
 ----------------- FLASK & UVICORN -----------------
 
-flask_app = Flask(name) @flask_app.route("/health") def health(): return f"AirdropVision v{VERSION} OK", 200
+flask_app = Flask(__name__) @flask_app.route("/health") def health(): return f"AirdropVision v{VERSION} OK", 200
 
 async def run_asgi_server(): port = int(os.environ.get("PORT", 8080)) config = uvicorn.Config( flask_app, host="0.0.0.0", port=port, log_level="warning", loop="asyncio" ) server = uvicorn.Server(config) logger.info(f"Starting ASGI server on port {port}...") await server.serve()
 
@@ -289,7 +289,7 @@ for q in POKER_TWEET_QUERIES:
                     continue
                 # send poker tweets but tag them so users can distinguish
                 if await db.seen_add(f"poker:{t['id']}", "poker", t):
-                    msg = f"🃏 *Poker/Tournament*
+                    msg = f"""🃏 *Poker/Tournament*
 
 {txt}
 
@@ -420,4 +420,4 @@ async with httpx.AsyncClient(
         await app.stop()
         await app.shutdown()
 
-if name == "main": try: asyncio.run(main()) except KeyboardInterrupt: logger.info("Program exited gracefully.") pass
+if __name__ == "__main__": try: asyncio.run(main()) except KeyboardInterrupt: logger.info("Program exited gracefully.") pass
