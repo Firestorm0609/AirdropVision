@@ -5,3 +5,6 @@ httpx
 beautifulsoup4
 flask
 lxml
+selenium
+python-docx
+pandas
