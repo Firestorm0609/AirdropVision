@@ -1,4 +1,5 @@
 aiosqlite
+uvicorn
 python-telegram-bot
 httpx
 beautifulsoup4
