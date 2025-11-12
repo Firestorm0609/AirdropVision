@@ -685,13 +685,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Settings actions
     elif data == "rotate_nitter":
+        global CURRENT_NITTER_INDEX
         # rotate by advancing index, persist, and show the selected instance
         async with NITTER_CHECK_LOCK:
             instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
         if not instances:
             await query.edit_message_text("⚠️ No Nitter instances available to rotate.", parse_mode=ParseMode.MARKDOWN)
             return
-        global CURRENT_NITTER_INDEX
         CURRENT_NITTER_INDEX = (CURRENT_NITTER_INDEX + 1) % len(instances)
         await persist_rotation_index()
         current_instance = instances[CURRENT_NITTER_INDEX]
@@ -701,12 +701,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "view_nitter_index":
+        global CURRENT_NITTER_INDEX
         async with NITTER_CHECK_LOCK:
             instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
         if not instances:
             await query.edit_message_text("⚠️ No Nitter instances available.", parse_mode=ParseMode.MARKDOWN)
             return
-        global CURRENT_NITTER_INDEX
         cur_idx = CURRENT_NITTER_INDEX % len(instances)
         current_instance = instances[cur_idx]
         text = f"🔢 Rotation Index: `{CURRENT_NITTER_INDEX}`\n\nCurrent instance: `{current_instance}`"
