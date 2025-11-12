@@ -227,6 +227,9 @@ async def send_telegram_async(http_client: httpx.AsyncClient, text: str, parse_m
 # ----------------- STATE MANAGEMENT -----------------
 async def load_spam_words():
     """Loads spam words from DB into the global SPAM_WORDS set."""
+    # --- FIX: Moved global to the top ---
+    global SPAM_WORDS
+    
     stored = await db.meta_get_json("spam_keywords", [])
     if not stored:
         # Load from DEFAULT_SPAM_KEYWORDS only if DB is empty
@@ -234,7 +237,6 @@ async def load_spam_words():
         if stored:
             await db.meta_set_json("spam_keywords", stored)
 
-    global SPAM_WORDS
     SPAM_WORDS = set(stored)
     logger.info(f"Loaded {len(SPAM_WORDS)} spam filters.")
 
@@ -270,6 +272,9 @@ def parse_nitter(html: str, base_url: str):
     return results
 
 async def check_nitter_health(http_client: httpx.AsyncClient):
+    # --- FIX: Moved global to the top ---
+    global HEALTHY_NITTER_INSTANCES
+
     logger.info("Checking Nitter instances health...")
     async def check(instance):
         try:
@@ -283,7 +288,7 @@ async def check_nitter_health(http_client: httpx.AsyncClient):
     tasks = [check(i) for i in NITTER_INSTANCES]
     results = await asyncio.gather(*tasks)
     healthy = [r for r in results if r]
-    global HEALTHY_NITTER_INSTANCES
+
     async with NITTER_CHECK_LOCK:
         HEALTHY_NITTER_INSTANCES = healthy
     logger.info(f"Healthy Nitter instances: {len(healthy)}")
@@ -500,12 +505,14 @@ async def get_settings_menu():
     """
     Settings submenu: rotate, view, reset rotation index (inline).
     """
+    # --- FIX: Moved global to the top ---
+    global CURRENT_NITTER_INDEX
+    
     async with NITTER_CHECK_LOCK:
         instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
     instance_count = len(instances)
 
     # Determine currently indexed instance for display
-    global CURRENT_NITTER_INDEX
     current_instance = instances[CURRENT_NITTER_INDEX % instance_count] if instance_count > 0 else "N/A"
 
     text = (
@@ -627,17 +634,18 @@ async def del_query_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"⚠️ Query `{query}` not found.", parse_mode=ParseMode.MARKDOWN)
 
-# ----------------- Rotation CLI Commands (FIXED) -----------------
+# ----------------- Rotation CLI Commands -----------------
 async def nitterindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context):
         return
     
-    # --- FIX: Moved global declaration to the top ---
+    # --- FIX: Moved global to the top ---
     global CURRENT_NITTER_INDEX
     
     async with NITTER_CHECK_LOCK:
         instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
     total = len(instances)
+
     cur_idx = CURRENT_NITTER_INDEX % total if total > 0 else -1
     cur_inst = instances[cur_idx] if total > 0 else "N/A"
     await update.message.reply_text(f"🔢 Rotation Index: `{CURRENT_NITTER_INDEX}`\n\nCurrent instance: `{cur_inst}`", parse_mode=ParseMode.MARKDOWN)
@@ -645,7 +653,10 @@ async def nitterindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def resetindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context):
         return
+    
+    # --- This one was already correct, but good to check ---
     global CURRENT_NITTER_INDEX
+    
     CURRENT_NITTER_INDEX = 0
     await persist_rotation_index()
     await update.message.reply_text("♻️ Rotation index reset to `0`.", parse_mode=ParseMode.MARKDOWN)
@@ -654,6 +665,9 @@ async def resetindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context):
         return
+
+    # --- FIX: Moved global to the top of the function ---
+    global CURRENT_NITTER_INDEX
 
     query = update.callback_query
     await query.answer()
@@ -694,7 +708,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not instances:
             await query.edit_message_text("⚠️ No Nitter instances available to rotate.", parse_mode=ParseMode.MARKDOWN)
             return
-        global CURRENT_NITTER_INDEX
+        
         CURRENT_NITTER_INDEX = (CURRENT_NITTER_INDEX + 1) % len(instances)
         await persist_rotation_index()
         current_instance = instances[CURRENT_NITTER_INDEX]
@@ -709,7 +723,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not instances:
             await query.edit_message_text("⚠️ No Nitter instances available.", parse_mode=ParseMode.MARKDOWN)
             return
-        global CURRENT_NITTER_INDEX
+        
         cur_idx = CURRENT_NITTER_INDEX % len(instances)
         current_instance = instances[cur_idx]
         text = f"🔢 Rotation Index: `{CURRENT_NITTER_INDEX}`\n\nCurrent instance: `{current_instance}`"
@@ -718,7 +732,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "reset_nitter_index":
-        global CURRENT_NITTER_INDEX
         CURRENT_NITTER_INDEX = 0
         await persist_rotation_index()
         text = "♻️ Rotation index reset to `0`."
