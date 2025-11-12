@@ -387,7 +387,8 @@ async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], 
         if not success:
             logger.warning(f"All Nitter instances failed for query: {q}")
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(10) # Give each instance a 10-second break
+
 
 # ----------------- MAIN SCHEDULERS -----------------
 async def scheduler_loop(http_client: httpx.AsyncClient):
