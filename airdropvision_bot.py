@@ -627,14 +627,17 @@ async def del_query_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"⚠️ Query `{query}` not found.", parse_mode=ParseMode.MARKDOWN)
 
-# ----------------- Rotation CLI Commands -----------------
+# ----------------- Rotation CLI Commands (FIXED) -----------------
 async def nitterindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context):
         return
+    
+    # --- FIX: Moved global declaration to the top ---
+    global CURRENT_NITTER_INDEX
+    
     async with NITTER_CHECK_LOCK:
         instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
     total = len(instances)
-    global CURRENT_NITTER_INDEX
     cur_idx = CURRENT_NITTER_INDEX % total if total > 0 else -1
     cur_inst = instances[cur_idx] if total > 0 else "N/A"
     await update.message.reply_text(f"🔢 Rotation Index: `{CURRENT_NITTER_INDEX}`\n\nCurrent instance: `{cur_inst}`", parse_mode=ParseMode.MARKDOWN)
@@ -685,13 +688,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Settings actions
     elif data == "rotate_nitter":
-        global CURRENT_NITTER_INDEX
         # rotate by advancing index, persist, and show the selected instance
         async with NITTER_CHECK_LOCK:
             instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
         if not instances:
             await query.edit_message_text("⚠️ No Nitter instances available to rotate.", parse_mode=ParseMode.MARKDOWN)
             return
+        global CURRENT_NITTER_INDEX
         CURRENT_NITTER_INDEX = (CURRENT_NITTER_INDEX + 1) % len(instances)
         await persist_rotation_index()
         current_instance = instances[CURRENT_NITTER_INDEX]
@@ -701,12 +704,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "view_nitter_index":
-        global CURRENT_NITTER_INDEX
         async with NITTER_CHECK_LOCK:
             instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
         if not instances:
             await query.edit_message_text("⚠️ No Nitter instances available.", parse_mode=ParseMode.MARKDOWN)
             return
+        global CURRENT_NITTER_INDEX
         cur_idx = CURRENT_NITTER_INDEX % len(instances)
         current_instance = instances[cur_idx]
         text = f"🔢 Rotation Index: `{CURRENT_NITTER_INDEX}`\n\nCurrent instance: `{current_instance}`"
@@ -833,3 +836,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Program exited gracefully.")
+
