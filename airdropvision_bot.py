@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-AirdropVision v1.0 — FULL INLINE COMMANDS EDITION
-REMOVED: All Feature Toggles (including Web3 Jobs and Airdrop toggle).
-SIMPLIFIED: Scheduler now only runs Custom Nitter Queries.
-ADDED: Inline buttons for /addquery, /delquery, /addfilter, /delfilter command entry points.
+AirdropVision v1.1 — FULL INLINE COMMANDS EDITION
+Changes from v1.0:
+ - Replaced sqlite DB with an async JSON DB (db.json) as requested.
+ - Proper rotation across Nitter instances with persistent rotation index.
+ - Added Settings submenu with rotate/view/reset rotation inline actions.
+ - Added CLI commands: /nitterindex and /resetindex
 """
 
 import logging
@@ -14,9 +16,10 @@ import os
 import json
 import urllib.parse
 from typing import List, Dict, Set, Optional
+from datetime import datetime
 
 # External dependencies
-import aiosqlite
+import aiofiles
 from bs4 import BeautifulSoup
 from flask import Flask
 
@@ -40,8 +43,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "10"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = "1.0.0" # UPDATED VERSION
-DB_PATH = os.environ.get("DB_PATH", "airdropvision_v5.db")
+VERSION = "1.1.0"
+DB_PATH = os.environ.get("DB_PATH", "db.json")  # now storing JSON DB file
 HTTP_TIMEOUT = 15
 
 # --- Nitter Config ---
@@ -58,7 +61,7 @@ DEFAULT_CUSTOM_QUERIES = [
 ]
 
 # --- Spam Config ---
-DEFAULT_SPAM_KEYWORDS = "" # UPDATED: Empty string to start with no default filters
+DEFAULT_SPAM_KEYWORDS = ""  # start empty by default
 
 # --- Global State & Locks ---
 SPAM_WORDS: Set[str] = set()
@@ -66,6 +69,10 @@ HEALTHY_NITTER_INSTANCES: List[str] = []
 NITTER_CHECK_LOCK = asyncio.Lock()
 FILTER_LOCK = asyncio.Lock()
 QUERY_LOCK = asyncio.Lock()
+
+# rotation index (persisted in DB under meta key "nitter_rotation_index")
+CURRENT_NITTER_INDEX = 0
+ROTATION_PERSIST_LOCK = asyncio.Lock()
 
 # ----------------- LOGGING SETUP -----------------
 logging.basicConfig(
@@ -76,86 +83,117 @@ logger = logging.getLogger(BOT_NAME)
 
 
 # ----------------------------------------------------------------------
-## 2. 🗃️ DATABASE LOGIC
+## 2. 🗃️ ASYNC JSON DB LOGIC (db.json)
 # ----------------------------------------------------------------------
+# Structure:
+# {
+#   "seen": { "<id>": {"kind": "...", "meta": {...}, "created_at": "..."} },
+#   "meta": { "k": "v", ... }
+# }
 
-CREATE_SEEN_SQL = """
-CREATE TABLE IF NOT EXISTS seen (
-    id TEXT PRIMARY KEY,
-    kind TEXT,
-    meta TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"""
-CREATE_META_SQL = """
-CREATE TABLE IF NOT EXISTS meta (
-    k TEXT PRIMARY KEY,
-    v TEXT
-);
-"""
-
-class DB:
+class JSONDB:
     def __init__(self, path=DB_PATH):
         self.path = path
         self._init_done = False
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # protects reads/writes
 
     async def init(self):
-        if self._init_done: return
+        if self._init_done:
+            return
         async with self._lock:
-            if self._init_done: return
-            async with aiosqlite.connect(self.path) as conn:
-                await conn.execute(CREATE_SEEN_SQL)
-                await conn.execute(CREATE_META_SQL)
-                await conn.commit()
+            if self._init_done:
+                return
+            # ensure file exists and has minimal structure
+            if not os.path.exists(self.path):
+                initial = {"seen": {}, "meta": {}}
+                async with aiofiles.open(self.path, "w") as f:
+                    await f.write(json.dumps(initial))
+            else:
+                # ensure keys exist
+                try:
+                    async with aiofiles.open(self.path, "r") as f:
+                        raw = await f.read()
+                        data = json.loads(raw) if raw.strip() else {}
+                except Exception:
+                    data = {}
+                changed = False
+                if "seen" not in data:
+                    data["seen"] = {}
+                    changed = True
+                if "meta" not in data:
+                    data["meta"] = {}
+                    changed = True
+                if changed:
+                    async with aiofiles.open(self.path, "w") as f:
+                        await f.write(json.dumps(data))
             self._init_done = True
-            logger.info("Database initialized.")
+            logger.info("JSON DB initialized.")
 
-    async def seen_add(self, id: str, kind: str = "generic", meta: Optional[dict] = None) -> bool:
+    async def _read(self) -> dict:
         await self.init()
-        try:
-            async with aiosqlite.connect(self.path) as conn:
-                await conn.execute(
-                    "INSERT INTO seen(id, kind, meta) VALUES (?, ?, ?)",
-                    (id, kind, json.dumps(meta or {})),
-                )
-                await conn.commit()
-            return True
-        except aiosqlite.IntegrityError:
+        async with self._lock:
+            try:
+                async with aiofiles.open(self.path, "r") as f:
+                    raw = await f.read()
+                    return json.loads(raw) if raw.strip() else {"seen": {}, "meta": {}}
+            except FileNotFoundError:
+                return {"seen": {}, "meta": {}}
+            except Exception as e:
+                logger.error(f"Failed to read DB file: {e}")
+                return {"seen": {}, "meta": {}}
+
+    async def _write(self, data: dict):
+        async with self._lock:
+            async with aiofiles.open(self.path, "w") as f:
+                await f.write(json.dumps(data))
+
+    # seen operations
+    async def seen_add(self, id: str, kind: str = "generic", meta: Optional[dict] = None) -> bool:
+        data = await self._read()
+        seen = data.get("seen", {})
+        if id in seen:
             return False
+        seen[id] = {
+            "kind": kind,
+            "meta": meta or {},
+            "created_at": datetime.utcnow().isoformat() + "Z"
+        }
+        data["seen"] = seen
+        await self._write(data)
+        return True
 
     async def seen_count(self) -> int:
-        await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            async with conn.execute("SELECT COUNT(1) FROM seen") as cur:
-                row = await cur.fetchone()
-                return row[0] if row else 0
+        data = await self._read()
+        return len(data.get("seen", {}))
 
+    # meta operations (string)
     async def meta_get(self, k: str, default=None):
-        await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            async with conn.execute("SELECT v FROM meta WHERE k=?", (k,)) as cur:
-                row = await cur.fetchone()
-                return row['v'] if row else default
+        data = await self._read()
+        return data.get("meta", {}).get(k, default)
 
     async def meta_set(self, k: str, v: str):
-        await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            await conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)", (k, v))
-            await conn.commit()
+        data = await self._read()
+        meta = data.get("meta", {})
+        meta[k] = v
+        data["meta"] = meta
+        await self._write(data)
 
-    async def meta_get_json(self, k: str, default: dict = {}) -> dict:
-        val = await self.meta_get(k)
-        if not val: return default
-        try: return json.loads(val)
-        except: return default
+    # meta json convenience
+    async def meta_get_json(self, k: str, default: dict = {}):
+        val = await self.meta_get(k, None)
+        if val is None:
+            return default
+        try:
+            return json.loads(val)
+        except Exception:
+            return default
 
     async def meta_set_json(self, k: str, v: dict):
         await self.meta_set(k, json.dumps(v))
 
+
 # Create a single, shared instance
-db = DB()
+db = JSONDB()
 
 
 # ----------------------------------------------------------------------
@@ -164,10 +202,10 @@ db = DB()
 
 # ----------------- TELEGRAM SENDER -----------------
 async def send_telegram_async(http_client: httpx.AsyncClient, text: str, parse_mode="Markdown"):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: 
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set. Skipping send.")
         return
-        
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -178,8 +216,9 @@ async def send_telegram_async(http_client: httpx.AsyncClient, text: str, parse_m
     try:
         r = await http_client.post(url, json=payload, timeout=10)
         if r.status_code == 429:
+            # simple retry/backoff
             await asyncio.sleep(5)
-            await send_telegram_async(http_client, text, parse_mode) # Retry
+            await send_telegram_async(http_client, text, parse_mode)
         elif r.status_code != 200:
             logger.warning(f"Telegram API failed: {r.status_code} - {r.text}")
     except Exception as e:
@@ -193,14 +232,15 @@ async def load_spam_words():
         # Load from DEFAULT_SPAM_KEYWORDS only if DB is empty
         stored = [s.strip().lower() for s in DEFAULT_SPAM_KEYWORDS.split(',') if s.strip()]
         if stored:
-             await db.meta_set_json("spam_keywords", stored)
-             
+            await db.meta_set_json("spam_keywords", stored)
+
     global SPAM_WORDS
     SPAM_WORDS = set(stored)
     logger.info(f"Loaded {len(SPAM_WORDS)} spam filters.")
 
 def is_spam(text: str) -> bool:
-    if not text: return False
+    if not text:
+        return False
     text_low = text.lower()
     return any(w in text_low for w in SPAM_WORDS)
 
@@ -219,7 +259,8 @@ def parse_nitter(html: str, base_url: str):
     items = soup.find_all("div", class_="timeline-item")
     for item in items:
         link = item.find("a", class_="tweet-link")
-        if not link: continue
+        if not link:
+            continue
         href = link.get("href", "")
         tweet_id = href.split("/")[-1].replace("#m", "")
         url = urllib.parse.urljoin(base_url, href)
@@ -235,7 +276,8 @@ async def check_nitter_health(http_client: httpx.AsyncClient):
             r = await http_client.get(f"{instance}/search?q=test", timeout=8)
             if r.status_code == 200 and ("timeline" in r.text or "tweet" in r.text):
                 return instance
-        except: pass
+        except Exception:
+            pass
         return None
 
     tasks = [check(i) for i in NITTER_INSTANCES]
@@ -249,40 +291,97 @@ async def check_nitter_health(http_client: httpx.AsyncClient):
 async def nitter_health_loop(http_client: httpx.AsyncClient):
     while True:
         await check_nitter_health(http_client)
-        await asyncio.sleep(1800) # 30 mins
+        await asyncio.sleep(1800)  # 30 mins
 
+# ----------------- Rotation persistence helpers -----------------
+async def load_rotation_index():
+    """Load rotation index from DB into CURRENT_NITTER_INDEX."""
+    global CURRENT_NITTER_INDEX
+    val = await db.meta_get("nitter_rotation_index", "0")
+    try:
+        CURRENT_NITTER_INDEX = int(val) if val is not None else 0
+    except Exception:
+        CURRENT_NITTER_INDEX = 0
+    logger.info(f"Loaded Nitter rotation index: {CURRENT_NITTER_INDEX}")
+
+async def persist_rotation_index():
+    """Persist CURRENT_NITTER_INDEX into the DB."""
+    global CURRENT_NITTER_INDEX
+    async with ROTATION_PERSIST_LOCK:
+        try:
+            await db.meta_set("nitter_rotation_index", str(int(CURRENT_NITTER_INDEX)))
+        except Exception as e:
+            logger.warning(f"Failed to persist rotation index: {e}")
+
+# ----------------- Fixed: rotating scan_nitter_query -----------------
 async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str):
-    # Feature toggle logic removed, always run scan if queries exist
+    """
+    Runs a Nitter search scan for each query, rotating between healthy instances.
+    Persist rotation index after each query's attempts so restarts resume rotation.
+    """
+    global CURRENT_NITTER_INDEX
+
     if not queries:
         logger.debug(f"Skipping {tag} scan (no queries provided).")
         return
 
     async with NITTER_CHECK_LOCK:
         instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
+
     if not instances:
-        logger.warning(f"No Nitter instances for {tag} scan.")
+        logger.warning(f"No Nitter instances available for {tag} scan.")
         return
 
+    total_instances = len(instances)
+
     for q in queries:
-        for instance in instances:
+        # Ensure rotation index is within bounds
+        if total_instances <= 0:
+            logger.warning("No instances found (post-check).")
+            return
+
+        start_idx = CURRENT_NITTER_INDEX % total_instances
+        success = False
+
+        for attempt in range(total_instances):
+            instance = instances[(start_idx + attempt) % total_instances]
             try:
                 url = f"{instance}/search?f=tweets&q={urllib.parse.quote(q)}"
                 r = await http_client.get(url, timeout=HTTP_TIMEOUT)
-                if r.status_code != 200: continue
-                
-                parsed = await asyncio.to_thread(parse_nitter, r.text, instance)
-                if not parsed: continue
 
+                if r.status_code != 200:
+                    logger.debug(f"{instance} returned {r.status_code} for {q}")
+                    continue
+
+                parsed = await asyncio.to_thread(parse_nitter, r.text, instance)
+                if not parsed:
+                    logger.debug(f"{instance} returned no results for query {q}")
+                    continue
+
+                found = 0
                 for t in parsed[:MAX_RESULTS]:
                     if is_spam(t['text']):
                         continue
                     if await db.seen_add(f"{db_kind}:{t['id']}", db_kind, t):
                         msg = f"{tag} (Query: `{q}`)\n\n{t['text']}\n\n🔗 [Link]({t['url']})"
                         await send_telegram_async(http_client, msg)
+                        found += 1
                         await asyncio.sleep(0.5)
-                break 
+
+                logger.info(f"[{tag}] {instance} — {found} new results for query: {q}")
+                success = True
+                break  # Success — stop trying other instances for this query
+
             except Exception as e:
-                logger.debug(f"Nitter error {instance}: {e}")
+                logger.debug(f"Nitter error ({instance}): {e}")
+
+        # Advance the rotation index globally for next run and persist it
+        CURRENT_NITTER_INDEX = (CURRENT_NITTER_INDEX + 1) % total_instances
+        await persist_rotation_index()
+
+        if not success:
+            logger.warning(f"All Nitter instances failed for query: {q}")
+
         await asyncio.sleep(2)
 
 # ----------------- MAIN SCHEDULERS -----------------
@@ -292,7 +391,7 @@ async def scheduler_loop(http_client: httpx.AsyncClient):
         try:
             custom_queries = await get_custom_nitter_queries()
             await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
-            
+
             count = await db.seen_count()
             logger.info(f"Scan cycle complete. DB Size: {count}")
         except Exception as e:
@@ -304,7 +403,7 @@ async def run_manual_scan(http_client: httpx.AsyncClient, chat_id: int, context)
     try:
         custom_queries = await get_custom_nitter_queries()
         await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
-        
+
         await context.bot.send_message(chat_id, "✅ Manual Scan Complete.")
     except Exception as e:
         logger.error(f"Manual scan error: {e}")
@@ -312,7 +411,7 @@ async def run_manual_scan(http_client: httpx.AsyncClient, chat_id: int, context)
 
 
 # ----------------------------------------------------------------------
-## 4. 🤖 TELEGRAM BOT & UI LOGIC
+## 4. 🤖 TELEGRAM BOT & UI LOGIC (with Settings submenu)
 # ----------------------------------------------------------------------
 
 # ----------------- AUTH HELPER -----------------
@@ -339,6 +438,7 @@ async def get_main_menu():
         [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
         [InlineKeyboardButton("🐦 Custom Queries", callback_data="queries_menu")],
         [InlineKeyboardButton("🚫 Spam Filters", callback_data="filters_menu")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="settings_menu")],
         [InlineKeyboardButton("🚀 Force Scan Now", callback_data="scan_now")],
     ]
     return text, InlineKeyboardMarkup(keyboard)
@@ -349,7 +449,7 @@ async def get_stats_menu():
     queries_count = len(await get_custom_nitter_queries())
     async with NITTER_CHECK_LOCK:
         healthy_count = len(HEALTHY_NITTER_INSTANCES)
-    
+
     text = (
         "📊 *Bot Statistics*\n\n"
         f"➡️ **Items Tracked:** `{count}`\n"
@@ -372,8 +472,9 @@ async def get_queries_menu():
 async def get_list_queries_menu():
     queries = await get_custom_nitter_queries()
     text = "📜 *Active Nitter Search Queries:*\n\n" + "\n".join([f"• `{q}`" for q in queries])
-    if not queries: text = "No custom queries set."
-    
+    if not queries:
+        text = "No custom queries set."
+
     kb = [[InlineKeyboardButton("🔙 Back to Queries Menu", callback_data="queries_menu")]]
     return text, InlineKeyboardMarkup(kb)
 
@@ -389,9 +490,35 @@ async def get_filters_menu():
 async def get_list_filters_menu():
     await load_spam_words()
     text = "📜 *Active Spam Keywords:*\n\n" + "\n".join([f"• `{w}`" for w in sorted(list(SPAM_WORDS))])
-    if not SPAM_WORDS: text = "No filters set."
-    
+    if not SPAM_WORDS:
+        text = "No filters set."
+
     kb = [[InlineKeyboardButton("🔙 Back to Filters Menu", callback_data="filters_menu")]]
+    return text, InlineKeyboardMarkup(kb)
+
+async def get_settings_menu():
+    """
+    Settings submenu: rotate, view, reset rotation index (inline).
+    """
+    async with NITTER_CHECK_LOCK:
+        instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
+    instance_count = len(instances)
+
+    # Determine currently indexed instance for display
+    global CURRENT_NITTER_INDEX
+    current_instance = instances[CURRENT_NITTER_INDEX % instance_count] if instance_count > 0 else "N/A"
+
+    text = (
+        "⚙️ *Settings*\n\n"
+        f"➡️ **Rotation Index:** `{CURRENT_NITTER_INDEX}`\n"
+        f"➡️ **Current Instance (based on index):** `{current_instance}`\n\n"
+        "Use the buttons below to rotate or reset the Nitter rotation index."
+    )
+    kb = [
+        [InlineKeyboardButton("🔄 Rotate Nitter Instance", callback_data="rotate_nitter")],
+        [InlineKeyboardButton("🔍 View Rotation Index", callback_data="view_nitter_index"), InlineKeyboardButton("♻️ Reset Rotation Index", callback_data="reset_nitter_index")],
+        [InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]
+    ]
     return text, InlineKeyboardMarkup(kb)
 
 async def get_command_input_menu(action: str):
@@ -416,7 +543,8 @@ async def get_command_input_menu(action: str):
 # ----------------- COMMAND HANDLERS -----------------
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update, context): return
+    if not await auth_guard(update, context):
+        return
     text, markup = await get_main_menu()
     await update.message.reply_text(
         text,
@@ -426,13 +554,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Configuration commands are kept for ease of use and are the required input method
 async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update, context): return
+    if not await auth_guard(update, context):
+        return
     if not context.args:
         await update.message.reply_text("Usage: `/addfilter <word>`", parse_mode=ParseMode.MARKDOWN)
         return
-    
+
     word = " ".join(context.args).lower().strip()
-    
+
     async with FILTER_LOCK:
         current = list(SPAM_WORDS)
         if word not in current:
@@ -444,13 +573,14 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ Filter `{word}` already exists.", parse_mode=ParseMode.MARKDOWN)
 
 async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update, context): return
+    if not await auth_guard(update, context):
+        return
     if not context.args:
         await update.message.reply_text("Usage: `/delfilter <word>`", parse_mode=ParseMode.MARKDOWN)
         return
-        
+
     word = " ".join(context.args).lower().strip()
-    
+
     async with FILTER_LOCK:
         current = list(SPAM_WORDS)
         if word in current:
@@ -462,13 +592,14 @@ async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ Filter `{word}` not found.", parse_mode=ParseMode.MARKDOWN)
 
 async def add_query_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update, context): return
+    if not await auth_guard(update, context):
+        return
     if not context.args:
         await update.message.reply_text("Usage: `/addquery <full_twitter_search_query>`", parse_mode=ParseMode.MARKDOWN)
         return
-    
+
     query = " ".join(context.args).strip()
-    
+
     async with QUERY_LOCK:
         current = await db.meta_get_json("custom_nitter_queries", [])
         if query not in current:
@@ -479,13 +610,14 @@ async def add_query_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ Query `{query}` already exists.", parse_mode=ParseMode.MARKDOWN)
 
 async def del_query_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update, context): return
+    if not await auth_guard(update, context):
+        return
     if not context.args:
         await update.message.reply_text("Usage: `/delquery <full_twitter_search_query>`", parse_mode=ParseMode.MARKDOWN)
         return
-        
+
     query = " ".join(context.args).strip()
-    
+
     async with QUERY_LOCK:
         current = await db.meta_get_json("custom_nitter_queries", [])
         if query in current:
@@ -495,15 +627,36 @@ async def del_query_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"⚠️ Query `{query}` not found.", parse_mode=ParseMode.MARKDOWN)
 
-# ----------------- CALLBACK ROUTER -----------------
+# ----------------- Rotation CLI Commands -----------------
+async def nitterindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_guard(update, context):
+        return
+    async with NITTER_CHECK_LOCK:
+        instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
+    total = len(instances)
+    global CURRENT_NITTER_INDEX
+    cur_idx = CURRENT_NITTER_INDEX % total if total > 0 else -1
+    cur_inst = instances[cur_idx] if total > 0 else "N/A"
+    await update.message.reply_text(f"🔢 Rotation Index: `{CURRENT_NITTER_INDEX}`\n\nCurrent instance: `{cur_inst}`", parse_mode=ParseMode.MARKDOWN)
+
+async def resetindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_guard(update, context):
+        return
+    global CURRENT_NITTER_INDEX
+    CURRENT_NITTER_INDEX = 0
+    await persist_rotation_index()
+    await update.message.reply_text("♻️ Rotation index reset to `0`.", parse_mode=ParseMode.MARKDOWN)
+
+# ----------------- CALLBACK ROUTER (handles Settings actions) -----------------
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update, context): return
-    
+    if not await auth_guard(update, context):
+        return
+
     query = update.callback_query
     await query.answer()
-    
+
     data = query.data
-    
+
     # Menu Navigation
     if data == "main_menu":
         text, markup = await get_main_menu()
@@ -517,6 +670,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await get_filters_menu()
     elif data == "list_filters":
         text, markup = await get_list_filters_menu()
+    elif data == "settings_menu":
+        text, markup = await get_settings_menu()
 
     # Command Input Screens (NEW)
     elif data == "add_query_input":
@@ -527,14 +682,56 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await get_command_input_menu("add_filter")
     elif data == "del_filter_input":
         text, markup = await get_command_input_menu("del_filter")
-        
+
+    # Settings actions
+    elif data == "rotate_nitter":
+        # rotate by advancing index, persist, and show the selected instance
+        async with NITTER_CHECK_LOCK:
+            instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
+        if not instances:
+            await query.edit_message_text("⚠️ No Nitter instances available to rotate.", parse_mode=ParseMode.MARKDOWN)
+            return
+        global CURRENT_NITTER_INDEX
+        CURRENT_NITTER_INDEX = (CURRENT_NITTER_INDEX + 1) % len(instances)
+        await persist_rotation_index()
+        current_instance = instances[CURRENT_NITTER_INDEX]
+        text = f"🔄 Rotated Nitter index to `{CURRENT_NITTER_INDEX}`\n\nCurrent instance: `{current_instance}`"
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back to Settings", callback_data="settings_menu")]])
+        await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    elif data == "view_nitter_index":
+        async with NITTER_CHECK_LOCK:
+            instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
+        if not instances:
+            await query.edit_message_text("⚠️ No Nitter instances available.", parse_mode=ParseMode.MARKDOWN)
+            return
+        global CURRENT_NITTER_INDEX
+        cur_idx = CURRENT_NITTER_INDEX % len(instances)
+        current_instance = instances[cur_idx]
+        text = f"🔢 Rotation Index: `{CURRENT_NITTER_INDEX}`\n\nCurrent instance: `{current_instance}`"
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back to Settings", callback_data="settings_menu")]])
+        await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    elif data == "reset_nitter_index":
+        global CURRENT_NITTER_INDEX
+        CURRENT_NITTER_INDEX = 0
+        await persist_rotation_index()
+        text = "♻️ Rotation index reset to `0`."
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back to Settings", callback_data="settings_menu")]])
+        await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        return
+
     # Actions
     elif data == "scan_now":
+        # keep the edit message quick and spawn the manual scan
         await query.edit_message_text("🚀 Scanning now... this may take a moment.")
         http_client = context.application.bot_data['http_client']
+        # spawn manual scan as a background task so callback returns quickly
         asyncio.create_task(run_manual_scan(http_client, query.message.chat_id, context))
-        return # Do not edit message text after starting background task
-        
+        return  # Do not edit message text after starting background task
+
     else:
         logger.warning(f"Unknown callback data: {data}")
         await query.answer("Unknown action.", show_alert=True)
@@ -576,8 +773,11 @@ async def main():
 
         # Init DB and load initial state
         await db.init()
-        await load_spam_words() # Will load from DB or an empty list (since default is empty)
-        await get_custom_nitter_queries() 
+        await load_spam_words()  # Will load from DB or an empty list (since default is empty)
+        await get_custom_nitter_queries()
+
+        # Load persisted rotation index (so restarts resume rotation)
+        await load_rotation_index()
 
         # Start the web server
         asgi_server_task = asyncio.create_task(run_asgi_server())
@@ -592,7 +792,11 @@ async def main():
         app.add_handler(CommandHandler("delfilter", del_filter_cmd))
         app.add_handler(CommandHandler("addquery", add_query_cmd))
         app.add_handler(CommandHandler("delquery", del_query_cmd))
-        
+
+        # rotation commands
+        app.add_handler(CommandHandler("nitterindex", nitterindex_cmd))
+        app.add_handler(CommandHandler("resetindex", resetindex_cmd))
+
         app.add_handler(CallbackQueryHandler(callback_router))
 
         # --- Background Tasks ---
@@ -600,7 +804,7 @@ async def main():
         scheduler = asyncio.create_task(scheduler_loop(http_client))
 
         logger.info(f"Bot {VERSION} initialized. Starting polling...")
-        
+
         await app.initialize()
         await app.updater.start_polling()
         await app.start()
@@ -629,4 +833,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Program exited gracefully.")
-
