@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-AirdropVision v1.1 — ENHANCED NITTER RESILIENCE EDITION
-FIXED: Flask import and syntax errors
-UPDATED: More reliable Nitter instances and better error handling
+AirdropVision v1.0 — FULL INLINE COMMANDS EDITION
+REMOVED: All Feature Toggles (including Web3 Jobs and Airdrop toggle).
+SIMPLIFIED: Scheduler now only runs Custom Nitter Queries.
+ADDED: Inline buttons for /addquery, /delquery, /addfilter, /delfilter command entry points.
 """
 
 import logging
@@ -12,13 +13,12 @@ import uvicorn
 import os
 import json
 import urllib.parse
-import random
 from typing import List, Dict, Set, Optional
 
 # External dependencies
 import aiosqlite
 from bs4 import BeautifulSoup
-from flask import Flask  # FIXED: Added Flask import
+from flask import Flask
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -37,20 +37,16 @@ from telegram.ext import (
 # --- Core Bot Config ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "15"))
+POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL", "10"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 BOT_NAME = os.environ.get("BOT_NAME", "AirdropVision")
-VERSION = "1.1.0"
+VERSION = "1.0.0" # UPDATED VERSION
 DB_PATH = os.environ.get("DB_PATH", "airdropvision_v5.db")
-HTTP_TIMEOUT = 30
+HTTP_TIMEOUT = 15
 
-# --- Nitter Config - UPDATED INSTANCES ---
+# --- Nitter Config ---
 DEFAULT_NITTER_LIST = [
-    "https://nitter.privacyredirect.com",
-    "https://nitter.poast.org",
-    "https://nitter.fdn.fr", 
-    "https://nitter.1d4.us",
-    "https://nitter.kavin.rocks"
+    "https://nitter.net", "https://nitter.tiekoetter.com", "https://nitter.space"
 ]
 NITTER_INSTANCES_CSV = os.environ.get("NITTER_INSTANCES_CSV")
 NITTER_INSTANCES = [url.strip() for url in (NITTER_INSTANCES_CSV.split(',') if NITTER_INSTANCES_CSV else DEFAULT_NITTER_LIST) if url.strip()]
@@ -62,7 +58,7 @@ DEFAULT_CUSTOM_QUERIES = [
 ]
 
 # --- Spam Config ---
-DEFAULT_SPAM_KEYWORDS = ""
+DEFAULT_SPAM_KEYWORDS = "" # UPDATED: Empty string to start with no default filters
 
 # --- Global State & Locks ---
 SPAM_WORDS: Set[str] = set()
@@ -77,6 +73,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 )
 logger = logging.getLogger(BOT_NAME)
+
 
 # ----------------------------------------------------------------------
 ## 2. 🗃️ DATABASE LOGIC
@@ -160,6 +157,7 @@ class DB:
 # Create a single, shared instance
 db = DB()
 
+
 # ----------------------------------------------------------------------
 ## 3. 🕸️ SCRAPERS & BACKGROUND LOOPS
 # ----------------------------------------------------------------------
@@ -181,7 +179,7 @@ async def send_telegram_async(http_client: httpx.AsyncClient, text: str, parse_m
         r = await http_client.post(url, json=payload, timeout=10)
         if r.status_code == 429:
             await asyncio.sleep(5)
-            await send_telegram_async(http_client, text, parse_mode)
+            await send_telegram_async(http_client, text, parse_mode) # Retry
         elif r.status_code != 200:
             logger.warning(f"Telegram API failed: {r.status_code} - {r.text}")
     except Exception as e:
@@ -192,6 +190,7 @@ async def load_spam_words():
     """Loads spam words from DB into the global SPAM_WORDS set."""
     stored = await db.meta_get_json("spam_keywords", [])
     if not stored:
+        # Load from DEFAULT_SPAM_KEYWORDS only if DB is empty
         stored = [s.strip().lower() for s in DEFAULT_SPAM_KEYWORDS.split(',') if s.strip()]
         if stored:
              await db.meta_set_json("spam_keywords", stored)
@@ -206,14 +205,14 @@ def is_spam(text: str) -> bool:
     return any(w in text_low for w in SPAM_WORDS)
 
 async def get_custom_nitter_queries() -> List[str]:
-    """Retrieves custom queries from DB."""
+    """Retrieves custom queries from DB, setting defaults if none exist."""
     stored = await db.meta_get_json("custom_nitter_queries", [])
     if not stored:
         await db.meta_set_json("custom_nitter_queries", DEFAULT_CUSTOM_QUERIES)
         return DEFAULT_CUSTOM_QUERIES
     return stored
 
-# ----------------- NITTER/TWITTER - ENHANCED -----------------
+# ----------------- NITTER/TWITTER -----------------
 def parse_nitter(html: str, base_url: str):
     soup = BeautifulSoup(html, "lxml")
     results = []
@@ -229,122 +228,62 @@ def parse_nitter(html: str, base_url: str):
         results.append({"id": tweet_id, "url": url, "text": text})
     return results
 
-async def check_nitter_health_enhanced(http_client: httpx.AsyncClient):
-    """Enhanced health check with better error handling"""
+async def check_nitter_health(http_client: httpx.AsyncClient):
     logger.info("Checking Nitter instances health...")
-    
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-    ]
-    
     async def check(instance):
         try:
-            headers = {"User-Agent": random.choice(user_agents)}
-            r = await http_client.get(
-                f"{instance}/search?q=test", 
-                timeout=10,
-                headers=headers
-            )
+            r = await http_client.get(f"{instance}/search?q=test", timeout=8)
             if r.status_code == 200 and ("timeline" in r.text or "tweet" in r.text):
-                logger.debug(f"✅ Instance healthy: {instance}")
                 return instance
-            else:
-                logger.warning(f"❌ Instance {instance} returned status {r.status_code}")
-                return None
-        except Exception as e:
-            logger.debug(f"❌ Instance {instance} failed: {e}")
-            return None
+        except: pass
+        return None
 
     tasks = [check(i) for i in NITTER_INSTANCES]
     results = await asyncio.gather(*tasks)
     healthy = [r for r in results if r]
-    
     global HEALTHY_NITTER_INSTANCES
     async with NITTER_CHECK_LOCK:
         HEALTHY_NITTER_INSTANCES = healthy
-        
     logger.info(f"Healthy Nitter instances: {len(healthy)}")
-    if healthy:
-        logger.info(f"Working instances: {healthy}")
-    else:
-        logger.error("No healthy Nitter instances available!")
-    
-    return healthy
 
 async def nitter_health_loop(http_client: httpx.AsyncClient):
     while True:
-        await check_nitter_health_enhanced(http_client)
-        await asyncio.sleep(600)
+        await check_nitter_health(http_client)
+        await asyncio.sleep(1800) # 30 mins
 
-async def scan_nitter_query_enhanced(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str, max_retries=2):
-    """Enhanced scanner with retry logic"""
+async def scan_nitter_query(http_client: httpx.AsyncClient, queries: List[str], db_kind: str, tag: str):
+    # Feature toggle logic removed, always run scan if queries exist
     if not queries:
         logger.debug(f"Skipping {tag} scan (no queries provided).")
         return
 
     async with NITTER_CHECK_LOCK:
         instances = HEALTHY_NITTER_INSTANCES or NITTER_INSTANCES
-        
     if not instances:
         logger.warning(f"No Nitter instances for {tag} scan.")
-        instances = await check_nitter_health_enhanced(http_client)
-        if not instances:
-            logger.error("Still no healthy instances after refresh. Skipping scan.")
-            return
-
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    ]
+        return
 
     for q in queries:
-        success = False
-        for retry in range(max_retries):
-            random.shuffle(instances)
-            for instance in instances:
-                try:
-                    headers = {"User-Agent": random.choice(user_agents)}
-                    url = f"{instance}/search?f=tweets&q={urllib.parse.quote(q)}"
-                    logger.debug(f"Trying {instance} for query: {q}")
-                    
-                    r = await http_client.get(url, timeout=HTTP_TIMEOUT, headers=headers)
-                    
-                    if r.status_code == 200:
-                        parsed = await asyncio.to_thread(parse_nitter, r.text, instance)
-                        if parsed:
-                            logger.info(f"✅ Found {len(parsed)} results from {instance} for: {q}")
-                            
-                            for t in parsed[:MAX_RESULTS]:
-                                if is_spam(t['text']):
-                                    continue
-                                if await db.seen_add(f"{db_kind}:{t['id']}", db_kind, t):
-                                    msg = f"{tag} (Query: `{q}`)\n\n{t['text']}\n\n🔗 [Link]({t['url']})"
-                                    await send_telegram_async(http_client, msg)
-                                    await asyncio.sleep(1)
-                            
-                            success = True
-                            break
-                        else:
-                            logger.debug(f"No results from {instance} for query: {q}")
-                    elif r.status_code == 429:
-                        logger.warning(f"Rate limited by {instance}, will retry other instances")
+        for instance in instances:
+            try:
+                url = f"{instance}/search?f=tweets&q={urllib.parse.quote(q)}"
+                r = await http_client.get(url, timeout=HTTP_TIMEOUT)
+                if r.status_code != 200: continue
+                
+                parsed = await asyncio.to_thread(parse_nitter, r.text, instance)
+                if not parsed: continue
+
+                for t in parsed[:MAX_RESULTS]:
+                    if is_spam(t['text']):
                         continue
-                    else:
-                        logger.warning(f"Instance {instance} returned {r.status_code} for query: {q}")
-                        
-                except Exception as e:
-                    logger.debug(f"Nitter error {instance}: {e}")
-            
-            if success:
-                break
-            else:
-                logger.warning(f"Query '{q}' failed on all instances, retry {retry + 1}/{max_retries}")
-                if retry < max_retries - 1:
-                    await asyncio.sleep(10 * (retry + 1))
-        
-        await asyncio.sleep(8)
+                    if await db.seen_add(f"{db_kind}:{t['id']}", db_kind, t):
+                        msg = f"{tag} (Query: `{q}`)\n\n{t['text']}\n\n🔗 [Link]({t['url']})"
+                        await send_telegram_async(http_client, msg)
+                        await asyncio.sleep(0.5)
+                break 
+            except Exception as e:
+                logger.debug(f"Nitter error {instance}: {e}")
+        await asyncio.sleep(2)
 
 # ----------------- MAIN SCHEDULERS -----------------
 async def scheduler_loop(http_client: httpx.AsyncClient):
@@ -352,7 +291,7 @@ async def scheduler_loop(http_client: httpx.AsyncClient):
     while True:
         try:
             custom_queries = await get_custom_nitter_queries()
-            await scan_nitter_query_enhanced(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
+            await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
             
             count = await db.seen_count()
             logger.info(f"Scan cycle complete. DB Size: {count}")
@@ -364,12 +303,13 @@ async def run_manual_scan(http_client: httpx.AsyncClient, chat_id: int, context)
     await context.bot.send_message(chat_id, "🚀 Manual scan initiated...")
     try:
         custom_queries = await get_custom_nitter_queries()
-        await scan_nitter_query_enhanced(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
+        await scan_nitter_query(http_client, custom_queries, "custom_nitter", "🐦 *Custom Query Airdrop*")
         
         await context.bot.send_message(chat_id, "✅ Manual Scan Complete.")
     except Exception as e:
         logger.error(f"Manual scan error: {e}")
         await context.bot.send_message(chat_id, f"⚠️ Manual Scan Failed: {e}")
+
 
 # ----------------------------------------------------------------------
 ## 4. 🤖 TELEGRAM BOT & UI LOGIC
@@ -380,6 +320,7 @@ def is_authorized(chat_id: int) -> bool:
     return str(chat_id) == str(TELEGRAM_CHAT_ID)
 
 async def auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """A guard function to check auth on commands and callbacks."""
     chat_id = update.effective_chat.id
     if not is_authorized(chat_id):
         logger.warning(f"Unauthorized access attempt from chat_id: {chat_id}")
@@ -391,6 +332,7 @@ async def auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
     return True
 
 # ----------------- UI/MENU GENERATORS -----------------
+
 async def get_main_menu():
     text = f"✨ *{BOT_NAME} v{VERSION} | Main Menu*\n\nChoose an option to manage the bot's operation:"
     keyboard = [
@@ -413,8 +355,7 @@ async def get_stats_menu():
         f"➡️ **Items Tracked:** `{count}`\n"
         f"➡️ **Custom Queries:** `{queries_count}`\n"
         f"➡️ **Spam Filters:** `{spam_count}`\n"
-        f"➡️ **Healthy Nitter Nodes:** `{healthy_count}`\n"
-        f"➡️ **Version:** `{VERSION}`"
+        f"➡️ **Healthy Nitter Nodes:** `{healthy_count}`"
     )
     keyboard = [[InlineKeyboardButton("↩️ Back to Main Menu", callback_data="main_menu")]]
     return text, InlineKeyboardMarkup(keyboard)
@@ -473,6 +414,7 @@ async def get_command_input_menu(action: str):
     return text, InlineKeyboardMarkup(kb)
 
 # ----------------- COMMAND HANDLERS -----------------
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context): return
     text, markup = await get_main_menu()
@@ -482,6 +424,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
+# Configuration commands are kept for ease of use and are the required input method
 async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_guard(update, context): return
     if not context.args:
@@ -561,6 +504,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data = query.data
     
+    # Menu Navigation
     if data == "main_menu":
         text, markup = await get_main_menu()
     elif data == "stats":
@@ -573,6 +517,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await get_filters_menu()
     elif data == "list_filters":
         text, markup = await get_list_filters_menu()
+
+    # Command Input Screens (NEW)
     elif data == "add_query_input":
         text, markup = await get_command_input_menu("add_query")
     elif data == "del_query_input":
@@ -581,22 +527,24 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await get_command_input_menu("add_filter")
     elif data == "del_filter_input":
         text, markup = await get_command_input_menu("del_filter")
+        
+    # Actions
     elif data == "scan_now":
         await query.edit_message_text("🚀 Scanning now... this may take a moment.")
         http_client = context.application.bot_data['http_client']
         asyncio.create_task(run_manual_scan(http_client, query.message.chat_id, context))
-        return
+        return # Do not edit message text after starting background task
+        
     else:
         logger.warning(f"Unknown callback data: {data}")
         await query.answer("Unknown action.", show_alert=True)
         return
 
+    # Update the message with the new menu/screen
     await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
 # ----------------- FLASK & UVICORN -----------------
-# FIXED: Proper Flask app definition
 flask_app = Flask(__name__)
-
 @flask_app.route("/health")
 def health():
     return f"{BOT_NAME} v{VERSION} OK", 200
@@ -628,11 +576,8 @@ async def main():
 
         # Init DB and load initial state
         await db.init()
-        await load_spam_words()
-        await get_custom_nitter_queries()
-
-        # Initial health check
-        await check_nitter_health_enhanced(http_client)
+        await load_spam_words() # Will load from DB or an empty list (since default is empty)
+        await get_custom_nitter_queries() 
 
         # Start the web server
         asgi_server_task = asyncio.create_task(run_asgi_server())
@@ -641,12 +586,13 @@ async def main():
         app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
         app.bot_data['http_client'] = http_client
 
-        # --- Register Command Handlers ---
+        # --- Register Command Handlers (Input Required) ---
         app.add_handler(CommandHandler("start", start_cmd))
         app.add_handler(CommandHandler("addfilter", add_filter_cmd))
         app.add_handler(CommandHandler("delfilter", del_filter_cmd))
         app.add_handler(CommandHandler("addquery", add_query_cmd))
         app.add_handler(CommandHandler("delquery", del_query_cmd))
+        
         app.add_handler(CallbackQueryHandler(callback_router))
 
         # --- Background Tasks ---
@@ -677,8 +623,10 @@ async def main():
                     task.cancel()
             logger.info("Bot shut down gracefully.")
 
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Program exited gracefully.")
+
